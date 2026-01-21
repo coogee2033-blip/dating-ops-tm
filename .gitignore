@@ -1,0 +1,65 @@
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Temp
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# Build
+dist/
+build/
+out/
+
+# Secrets - NEVER commit
+*secret*
+*credential*
+*password*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Local notes
+notes.txt
+todo.txt
+scratch/
+local/
