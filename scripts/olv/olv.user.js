@@ -1,486 +1,395 @@
 // ==UserScript==
 // @name         Dating Ops - OLV
 // @namespace    dating-ops-tm
-// @version      1.1.0
-// @description  OLV (olv29.com) サイト用返信アシストツール
+// @version      2.3.0
+// @description  OLV (olv29.com) サイト用返信アシストツール - list/personal対応 + CORS回避版
 // @author       Dating Ops Team
 // @match        https://olv29.com/staff/*
 // @match        https://*.olv29.com/staff/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      docs.google.com
+// @connect      googleusercontent.com
+// @connect      google.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
+
+/**
+ * ============================================================
+ * 実装メモ (v2.3.0)
+ * ============================================================
+ * 
+ * 【ページモード判定】
+ *   - /staff/index → mode="list"（一括送信）
+ *   - /staff/personalbox → mode="personal"（個別送信）
+ *   - その他 → mode="other"
+ * 
+ * 【行検出】
+ *   - mode=list のみ実施
+ *   - scope特定: td.chatview → tr.rowitem → checkbox領域 → fallback
+ *   - isVisible は行検出では使わない（0化事故防止）
+ * 
+ * 【返信欄検出】
+ *   - 全モードで実施
+ *   - 優先順: message1 → msg.wd100 → msg → message → content
+ *   - 除外: memo/admin/note/futari/two_memo/staff
+ * 
+ * 【Google Sheet】
+ *   - GM_xmlhttpRequest でCORS回避
+ *   - エラー時は種別表示 + 直接入力フォールバック
+ * ============================================================
+ */
 
 (function() {
   'use strict';
 
   // ============================================================
-  // 実装メモ:
-  // - 返信欄検出: findReplyTextarea() で main → iframe の順に探索
-  //   優先順: message1 → .msg.wd100 → message → content
-  // - 行検出: countTargetRows() で tr.rowitem, tr[id^="row"] 等を検索
-  // - 返信欄未検出でも行検出は継続（早期return禁止）
-  // - 除外対象: admin_memo, staff_memo, two_memo, futari_memo, memo, note
-  // - 既存テキストがあれば上書き禁止
+  // 定数
   // ============================================================
+  const SITE_TYPE = 'olv';
+  const SITE_NAME = 'OLV';
+  const PANEL_ID = 'dating-ops-panel';
+  const STORAGE_PREFIX = 'datingOps_olv_';
+  const OBSERVER_DEBOUNCE_MS = 300;
+  const HEALTH_CHECK_MS = 3000;
+  const URL_POLL_MS = 500;
+
+  // 段階的検出のタイミング（ms）
+  const STAGED_DETECT_DELAYS = [0, 300, 800, 1500];
 
   // ============================================================
-  // sites.js - サイト固有設定（埋め込み）
+  // サイト設定
   // ============================================================
-  const SITE_CONFIGS = {
-    olv: {
-      siteType: 'olv',
-      siteName: 'OLV',
-      panelPages: [/\/staff\//],
-      
-      // 返信欄セレクタ（優先度順）
-      textareaSelectors: [
-        'textarea[name="message1"]',      // 最優先
-        'textarea.msg.wd100',             // OLV特有のクラス
-        'textarea.msg',                   // msgクラスのみ
-        'textarea[name="message"]',
-        'textarea[name="body"]',
-        'textarea[name="content"]',
-        'textarea:not([name*="memo"]):not([name*="admin"]):not([name*="note"])', // 汎用フォールバック
-      ],
-      
-      // 挿入禁止セレクタ（管理者メモ・二人メモ等）
-      excludeSelectors: [
-        'textarea[name="admin_memo"]',
-        'textarea[name="staff_memo"]',
-        'textarea[name="memo"]',
-        'textarea[name="note"]',
-        'textarea[name="two_memo"]',
-        'textarea[name="admin_note"]',
-        'textarea[name="futari_memo"]',
-        'textarea.admin-memo',
-        'textarea.staff-memo',
-        'textarea#admin_memo',
-        'textarea#staff_memo',
-        '[data-type="admin"]',
-        '[data-type="memo"]',
-      ],
-      
-      // 行検出用セレクタ（OLV特有）
-      rowSelectors: [
-        'tr.rowitem',
-        'tr[id^="row"]',
-        'tr[class*="row"]',
-        'table.list tr',
-        'table tr:has(td.chatview)',
-        'table tr:has(input[type="checkbox"])',
-      ],
-      
-      // 行内のチャットセル
-      rowChatCellSelector: 'td.chatview',
-      
-      // 行内のチェックボックス
-      rowCheckboxSelector: 'input[type="checkbox"]',
-      
-      // iframe検索用（全iframe対象）
-      iframeSelectors: [
-        'iframe',
-      ],
-      
-      ui: {
-        title: 'OLV 返信アシスト',
-        primaryColor: '#4a90d9',
-        accentColor: '#2c5282',
-      },
+  const CONFIG = {
+    // ページモード判定
+    pageModes: {
+      list: [/\/staff\/index/, /\/staff\/.*list/, /\/staff\/.*inbox/],
+      personal: [/\/staff\/personalbox/, /\/staff\/personal/, /\/staff\/.*detail/],
+    },
+
+    // 返信欄セレクタ（優先順位順）
+    textareaSelectors: [
+      'textarea[name="message1"]',
+      'textarea.msg.wd100',
+      'textarea.msg',
+      'textarea[name="message"]',
+      'textarea[name="body"]',
+      'textarea[name="content"]',
+    ],
+
+    // 除外キーワード
+    excludeKeywords: ['memo', 'admin', 'note', 'futari', 'two_memo', 'staff'],
+    excludeClassKeywords: ['admin', 'memo', 'note'],
+
+    // 行検出セレクタ
+    rowSelectors: ['tr.rowitem', 'tr[id^="row"]', 'tr[class*="row"]', 'tbody > tr', 'tr'],
+
+    // 表示件数テキスト
+    countTextSelectors: ['.count', '.result', '.paging', '.list_head', '[class*="count"]', '[class*="paging"]'],
+    countPatterns: [/(\d+)\s*件/, /表示\s*[:\s]*(\d+)/, /全\s*(\d+)/],
+
+    // トリガセレクタ
+    clickTriggerSelectors: [
+      'input[type="submit"][value*="更新"]', 'input[value="更新"]', '.reload-btn',
+      'input[type="submit"][value*="切替"]', 'input[type="submit"][value*="表示"]',
+      '.pagination a', '.paging a', 'a[href*="page="]',
+      'input[value*="一括"]', 'input[value*="チェック"]',
+    ],
+    changeTriggerSelectors: ['select[name*="box"]', 'select[name*="folder"]', 'select[name*="type"]'],
+
+    // 一覧領域候補（MutationObserver用）
+    listAreaSelectors: [
+      'table.list', 'table[class*="list"]', '#list_area', '.list_area',
+      'form table', '#main_content table', '.content table',
+    ],
+
+    ui: {
+      title: 'OLV 返信アシスト',
+      primaryColor: '#4a90d9',
+      accentColor: '#2c5282',
     },
   };
 
-  function getConfig(siteType) {
-    return SITE_CONFIGS[siteType] || null;
-  }
-
-  function shouldShowPanel(siteType, pathname) {
-    const config = getConfig(siteType);
-    if (!config) return false;
-    return config.panelPages.some(pattern => pattern.test(pathname));
-  }
-
   // ============================================================
-  // common.js - 共通コアモジュール（埋め込み）
+  // 状態
   // ============================================================
-  const PANEL_ID = 'dating-ops-panel';
-  const STORAGE_PREFIX = 'datingOps_';
-  const OBSERVER_DEBOUNCE_MS = 300;
-  const HEALTH_CHECK_MS = 3000;
-  const MAX_DETECT_RETRY = 5;
-  const DETECT_RETRY_INTERVAL = 1000;
-
   const state = {
-    siteType: 'olv',
-    config: null,
     initialized: false,
     stopped: false,
     panel: null,
     observer: null,
     healthTimer: null,
-    detectRetryCount: 0,
-    detectTimer: null,
+    urlPollTimer: null,
+    stagedDetectIndex: 0,
+    stagedDetectTimer: null,
+    lastUrl: '',
+
+    // ページモード
+    pageMode: 'other', // list, personal, other
+
+    // 返信欄
+    textarea: { status: 'pending', element: null, selector: null, where: null, iframeSrc: null },
+
+    // 行検出
+    rows: { count: 0, displayCountNum: null, scopeHint: null, usedSelector: null, mismatchWarning: null },
+
+    // 検出メタ
+    lastDetectTime: null,
+    lastTrigger: null,
+
+    // Sheet
     messages: [],
     sheetUrl: '',
-    sheetStatus: 'idle',
+    sheetStatus: 'idle', // idle, loading, success, error
     sheetError: null,
-    
-    // 返信欄情報（拡張）
-    textareaInfo: {
-      status: 'unknown',    // unknown, found, not_found, error
-      element: null,
-      selector: null,
-      where: null,          // 'main' | 'iframe'
-      iframeSrc: null,      // iframeのsrc（参考情報）
-      reason: null,
-    },
-    
-    // 行検出情報（新規）
-    rowInfo: {
-      displayCount: 0,      // 表示中の行数
-      checkedCount: 0,      // チェックされた行数
-      selectorHit: null,    // ヒットしたセレクタ
-    },
-    
+
+    // パネル
     panelPos: { x: 20, y: 20 },
     dragging: false,
     dragOffset: { x: 0, y: 0 },
+
+    // 監視
+    observeTargetHint: null,
   };
 
+  // ============================================================
+  // ロガー
+  // ============================================================
+  const LOG_PREFIX = `[DatingOps:${SITE_TYPE}]`;
   const LOG_STYLES = {
     info: 'background:#4a90d9;color:#fff;padding:2px 6px;border-radius:3px;',
     warn: 'background:#f6ad55;color:#000;padding:2px 6px;border-radius:3px;',
     error: 'background:#fc8181;color:#000;padding:2px 6px;border-radius:3px;',
   };
-
-  function log(level, msg, data = null) {
-    const tag = `DatingOps:${state.siteType}`;
-    const style = LOG_STYLES[level] || '';
-    if (data !== null) {
-      console.log(`%c${tag}%c ${msg}`, style, '', data);
-    } else {
-      console.log(`%c${tag}%c ${msg}`, style, '');
-    }
-  }
-
   const logger = {
-    info: (m, d) => log('info', m, d),
-    warn: (m, d) => log('warn', m, d),
-    error: (m, d) => log('error', m, d),
+    info: (msg, data) => console.log(`%c${LOG_PREFIX}%c ${msg}`, LOG_STYLES.info, '', data !== undefined ? data : ''),
+    warn: (msg, data) => console.log(`%c${LOG_PREFIX}%c ${msg}`, LOG_STYLES.warn, '', data !== undefined ? data : ''),
+    error: (msg, data) => console.log(`%c${LOG_PREFIX}%c ${msg}`, LOG_STYLES.error, '', data !== undefined ? data : ''),
   };
 
-  function $(sel, ctx = document) {
-    try {
-      if (!ctx || typeof ctx.querySelector !== 'function') return null;
-      return ctx.querySelector(sel);
-    } catch (e) { return null; }
-  }
+  // ============================================================
+  // ユーティリティ
+  // ============================================================
+  function $(sel, ctx) { try { return (ctx || document).querySelector(sel); } catch { return null; } }
+  function $$(sel, ctx) { try { return Array.from((ctx || document).querySelectorAll(sel)); } catch { return []; } }
+  function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+  function storageGet(k, d) { try { const v = localStorage.getItem(STORAGE_PREFIX + k); return v ? JSON.parse(v) : d; } catch { return d; } }
+  function storageSet(k, v) { try { localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); } catch {} }
+  function escapeHtml(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  function formatTime(ts) { if (!ts) return '--:--:--'; return new Date(ts).toTimeString().substring(0, 8); }
 
-  function $$(sel, ctx = document) {
-    try {
-      if (!ctx || typeof ctx.querySelectorAll !== 'function') return [];
-      return Array.from(ctx.querySelectorAll(sel));
-    } catch (e) { return []; }
-  }
-
-  function debounce(fn, ms) {
-    let t = null;
-    return (...args) => {
-      clearTimeout(t);
-      t = setTimeout(() => fn(...args), ms);
-    };
-  }
-
-  function storageGet(key, def = null) {
-    try {
-      const v = localStorage.getItem(STORAGE_PREFIX + key);
-      return v ? JSON.parse(v) : def;
-    } catch { return def; }
-  }
-
-  function storageSet(key, val) {
-    try {
-      localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(val));
-    } catch (e) { logger.warn('localStorage保存失敗', e); }
-  }
-
-  function escapeHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
+  // ============================================================
+  // ページモード判定
+  // ============================================================
+  function detectPageMode() {
+    const path = location.pathname;
+    for (const pattern of CONFIG.pageModes.list) {
+      if (pattern.test(path)) return 'list';
+    }
+    for (const pattern of CONFIG.pageModes.personal) {
+      if (pattern.test(path)) return 'personal';
+    }
+    return 'other';
   }
 
   // ============================================================
   // 除外判定
   // ============================================================
-  function isExcluded(el) {
-    if (!el || !state.config) return true;
-    
-    // 明示的な除外セレクタにマッチするか
-    for (const sel of state.config.excludeSelectors) {
-      try { if (el.matches(sel)) return true; } catch {}
-    }
-    
-    // data-type属性チェック
-    const dataType = el.getAttribute('data-type');
-    if (dataType && (dataType.includes('admin') || dataType.includes('memo'))) return true;
-    
-    // name/id属性に危険なキーワードが含まれるか
+  function isExcludedTextarea(el) {
+    if (!el) return true;
     const name = (el.name || '').toLowerCase();
     const id = (el.id || '').toLowerCase();
-    const className = (el.className || '').toLowerCase();
-    
-    const dangerousKeywords = ['memo', 'admin', 'note', 'futari', 'two_memo', 'staff'];
-    for (const kw of dangerousKeywords) {
+    const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+    for (const kw of CONFIG.excludeKeywords) {
       if (name.includes(kw) || id.includes(kw)) return true;
     }
-    
-    // クラス名に危険なキーワードが含まれるか（ただしmsgは除く）
-    for (const kw of ['admin', 'memo', 'note']) {
-      if (className.includes(kw)) return true;
+    for (const kw of CONFIG.excludeClassKeywords) {
+      if (cls.includes(kw)) return true;
     }
-    
+    const dt = el.getAttribute('data-type');
+    if (dt && (dt.includes('admin') || dt.includes('memo'))) return true;
+    return false;
+  }
+
+  function isElementVisible(el, win) {
+    if (!el) return false;
+    try {
+      const s = (win || window).getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) !== 0;
+    } catch { return true; }
+  }
+
+  // ============================================================
+  // scope特定（行検出用）
+  // ============================================================
+  function findRowScope() {
+    // (1) td.chatview
+    const cv = $('td.chatview');
+    if (cv) {
+      const t = cv.closest('table');
+      if (t) return { el: $('tbody', t) || t, hint: 'td.chatview → table' };
+    }
+    // (2) tr.rowitem
+    const ri = $('tr.rowitem');
+    if (ri) {
+      const t = ri.closest('table');
+      if (t) return { el: $('tbody', t) || t, hint: 'tr.rowitem → table' };
+    }
+    // (3) checkbox複数
+    const cbs = $$('table input[type="checkbox"]');
+    if (cbs.length >= 2) {
+      const t = cbs[0].closest('table');
+      if (t) return { el: $('tbody', t) || t, hint: `checkbox(${cbs.length}) → table` };
+    }
+    // (4) listAreaから探す
+    for (const sel of CONFIG.listAreaSelectors) {
+      const el = $(sel);
+      if (el) return { el, hint: `listArea: ${sel}` };
+    }
+    return { el: document.body, hint: 'fallback: body' };
+  }
+
+  function countRowsInScope(scopeEl) {
+    for (const sel of CONFIG.rowSelectors) {
+      try {
+        const rows = $$(sel, scopeEl).filter(tr => !$('th', tr));
+        if (rows.length > 0) return { count: rows.length, selector: sel };
+      } catch {}
+    }
+    return { count: 0, selector: null };
+  }
+
+  function extractDisplayCount() {
+    for (const sel of CONFIG.countTextSelectors) {
+      for (const el of $$(sel)) {
+        for (const pat of CONFIG.countPatterns) {
+          const m = (el.textContent || '').match(pat);
+          if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n >= 0) return n; }
+        }
+      }
+    }
+    return null;
+  }
+
+  // ============================================================
+  // 行検出
+  // ============================================================
+  function detectRows() {
+    if (state.pageMode !== 'list') {
+      state.rows = { count: state.pageMode === 'personal' ? 1 : 0, displayCountNum: null, scopeHint: 'N/A (not list mode)', usedSelector: null, mismatchWarning: null };
+      return;
+    }
+    const scope = findRowScope();
+    const res = countRowsInScope(scope.el);
+    const dispNum = extractDisplayCount();
+    let warn = null;
+    if (dispNum !== null && res.count === 0 && dispNum > 0) warn = '行セレクタ不一致';
+    else if (dispNum !== null && dispNum > 0 && Math.abs(res.count - dispNum) >= 5) warn = 'scope誤認の可能性';
+    state.rows = { count: res.count, displayCountNum: dispNum, scopeHint: scope.hint, usedSelector: res.selector, mismatchWarning: warn };
+  }
+
+  // ============================================================
+  // 返信欄検出
+  // ============================================================
+  function findReplyTextarea() {
+    for (const sel of CONFIG.textareaSelectors) {
+      for (const el of $$(sel)) {
+        if (!isExcludedTextarea(el) && isElementVisible(el)) {
+          return { element: el, selector: sel, where: 'main', iframeSrc: null };
+        }
+      }
+    }
+    for (const iframe of $$('iframe')) {
+      try {
+        const doc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (!doc) continue;
+        const win = iframe.contentWindow;
+        const src = iframe.src || iframe.name || 'iframe';
+        for (const sel of CONFIG.textareaSelectors) {
+          for (const el of $$(sel, doc)) {
+            if (!isExcludedTextarea(el) && isElementVisible(el, win)) {
+              return { element: el, selector: sel, where: 'iframe', iframeSrc: src };
+            }
+          }
+        }
+        if (doc.body?.contentEditable === 'true') {
+          return { element: doc.body, selector: 'body[contenteditable]', where: 'iframe', iframeSrc: src };
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  function detectTextarea() {
+    const res = findReplyTextarea();
+    if (res) {
+      state.textarea = { status: 'found', element: res.element, selector: res.selector, where: res.where, iframeSrc: res.iframeSrc };
+      return true;
+    }
+    state.textarea = { status: 'not_found', element: null, selector: null, where: null, iframeSrc: null };
     return false;
   }
 
   // ============================================================
-  // 返信欄検出（改良版）
-  // main document → 同一オリジン iframe の順に探索
+  // 統合検出
   // ============================================================
-  function findReplyTextarea() {
-    const cfg = state.config;
-    if (!cfg) {
-      return { el: null, where: null, selector: null, reason: '設定が読み込まれていません' };
-    }
-
-    // (1) main document を検索
-    for (const sel of cfg.textareaSelectors) {
-      try {
-        const els = $$(sel, document);
-        for (const el of els) {
-          if (!isExcluded(el) && isVisible(el)) {
-            logger.info(`[main] 返信欄検出: ${sel}`, el);
-            return { el, where: 'main', selector: sel, reason: null };
-          }
-        }
-      } catch (e) {
-        // セレクタがブラウザ非対応の場合（:has等）は握りつぶす
-      }
-    }
-
-    // (2) 全ての iframe を検索（同一オリジンのみ）
-    const allIframes = $$('iframe', document);
-    for (let i = 0; i < allIframes.length; i++) {
-      const iframe = allIframes[i];
-      try {
-        const doc = iframe.contentDocument || iframe.contentWindow?.document;
-        if (!doc) continue;
-        
-        for (const sel of cfg.textareaSelectors) {
-          try {
-            const els = $$(sel, doc);
-            for (const el of els) {
-              if (!isExcluded(el)) {
-                const iframeSrc = iframe.src || iframe.name || `iframe[${i}]`;
-                logger.info(`[iframe:${i}] 返信欄検出: ${sel}`, { iframe: iframeSrc, el });
-                return { el, where: 'iframe', selector: sel, iframeIndex: i, iframeSrc, reason: null };
-              }
-            }
-          } catch (e) {}
-        }
-        
-        // contentEditable body
-        if (doc.body?.contentEditable === 'true') {
-          const iframeSrc = iframe.src || iframe.name || `iframe[${i}]`;
-          logger.info(`[iframe:${i}] contentEditable検出`, iframeSrc);
-          return { el: doc.body, where: 'iframe', selector: 'body[contenteditable]', iframeIndex: i, iframeSrc, reason: null };
-        }
-      } catch (e) {
-        // SecurityError: クロスオリジンは無視
-        if (e.name === 'SecurityError') {
-          logger.warn(`iframe[${i}] クロスオリジン - スキップ`);
-        }
-      }
-    }
-
-    // 見つからなかった
-    const tried = cfg.textareaSelectors.join(', ');
-    return { el: null, where: null, selector: null, reason: `検索済みセレクタ: ${tried}` };
-  }
-
-  // 要素が可視かどうか（display:none等でないか）
-  function isVisible(el) {
-    if (!el) return false;
-    // offsetParent が null なら非表示（ただしposition:fixed等は例外）
-    // シンプルに display:none / visibility:hidden をチェック
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    return true;
-  }
-
-  // state.textareaInfo を更新
-  function updateTextareaInfo(result) {
-    state.textareaInfo = {
-      status: result.el ? 'found' : 'not_found',
-      element: result.el,
-      selector: result.selector,
-      where: result.where,
-      iframeSrc: result.iframeSrc || null,
-      reason: result.reason,
-    };
-  }
-
-  // ============================================================
-  // 行検出（新規）
-  // OLV特有の tr.rowitem, tr[id^="row"] 等を検索
-  // ============================================================
-  function countTargetRows() {
-    const cfg = state.config;
-    if (!cfg || !cfg.rowSelectors) {
-      state.rowInfo = { displayCount: 0, checkedCount: 0, selectorHit: null };
-      return;
-    }
-
-    let displayCount = 0;
-    let checkedCount = 0;
-    let selectorHit = null;
-
-    // 各セレクタを試す
-    for (const sel of cfg.rowSelectors) {
-      try {
-        const rows = $$(sel, document);
-        if (rows.length > 0) {
-          displayCount = rows.length;
-          selectorHit = sel;
-          
-          // チェックボックスがあればチェック済み行を数える
-          if (cfg.rowCheckboxSelector) {
-            for (const row of rows) {
-              const cb = $(cfg.rowCheckboxSelector, row);
-              if (cb && cb.checked) checkedCount++;
-            }
-          }
-          
-          logger.info(`行検出: ${sel} → ${displayCount}件 (checked: ${checkedCount})`);
-          break; // 最初にヒットしたセレクタを使用
-        }
-      } catch (e) {
-        // :has等の非対応セレクタは握りつぶす
-      }
-    }
-
-    // フォールバック: 汎用的なtable rowを数える
-    if (displayCount === 0) {
-      const fallbackRows = $$('table tr', document).filter(tr => {
-        // ヘッダー行は除外
-        if ($(tr, 'th')) return false;
-        // 最低限tdがあること
-        return $('td', tr) !== null;
-      });
-      if (fallbackRows.length > 0) {
-        displayCount = fallbackRows.length;
-        selectorHit = 'table tr (fallback)';
-        logger.info(`行検出(fallback): ${displayCount}件`);
-      }
-    }
-
-    state.rowInfo = { displayCount, checkedCount, selectorHit };
-  }
-
-  // ============================================================
-  // 統合検出（返信欄 + 行）
-  // 返信欄が未検出でも行検出は実行する（早期return禁止）
-  // ============================================================
-  function detectAll() {
-    // 返信欄検出
-    const taResult = findReplyTextarea();
-    updateTextareaInfo(taResult);
-
-    // 行検出（返信欄の結果に関わらず実行）
-    countTargetRows();
-
-    return taResult.el;
-  }
-
-  function detectAllWithRetry() {
+  function runDetection(trigger) {
     if (state.stopped) return;
-    clearTimeout(state.detectTimer);
-    state.detectRetryCount = 0;
-    
-    function attempt() {
-      if (state.stopped) return;
-      
-      const el = detectAll();
-      
-      // 行は検出されたが返信欄が未検出 → リトライ
-      if (!el && state.rowInfo.displayCount > 0) {
-        state.detectRetryCount++;
-        if (state.detectRetryCount < MAX_DETECT_RETRY) {
-          logger.info(`返信欄再検出 (${state.detectRetryCount}/${MAX_DETECT_RETRY}) - 行は${state.rowInfo.displayCount}件検出済み`);
-          state.detectTimer = setTimeout(attempt, DETECT_RETRY_INTERVAL);
-          updateUI();
-          return;
-        } else {
-          logger.warn('返信欄検出リトライ上限 - 行は検出済み');
+    state.pageMode = detectPageMode();
+    detectRows();
+    detectTextarea();
+    state.lastDetectTime = Date.now();
+    state.lastTrigger = trigger || 'manual';
+    logger.info(`検出 [${trigger}] mode=${state.pageMode} rows=${state.rows.count} ta=${state.textarea.status}`);
+    updateUI();
+  }
+
+  function runStagedDetection() {
+    if (state.stopped) return;
+    clearTimeout(state.stagedDetectTimer);
+    state.stagedDetectIndex = 0;
+
+    function next() {
+      if (state.stopped || state.stagedDetectIndex >= STAGED_DETECT_DELAYS.length) return;
+      const delay = STAGED_DETECT_DELAYS[state.stagedDetectIndex];
+      state.stagedDetectTimer = setTimeout(() => {
+        runDetection(`init-stage${state.stagedDetectIndex}`);
+        state.stagedDetectIndex++;
+        // 行が見つかったら終了、見つからなければ次へ
+        if (state.pageMode === 'list' && state.rows.count === 0 && state.stagedDetectIndex < STAGED_DETECT_DELAYS.length) {
+          next();
         }
-      }
-      
-      // 返信欄が検出された or リトライ上限
-      state.detectRetryCount = 0;
-      updateUI();
+      }, delay);
     }
-    
-    attempt();
+    next();
   }
 
   // ============================================================
   // テキスト挿入
   // ============================================================
   function insertText(text) {
-    const ta = state.textareaInfo.element;
-    if (!ta) {
-      showNotify('返信欄が見つかりません', 'error');
-      logger.error('挿入失敗: テキストエリアなし');
-      return false;
-    }
-    if (isExcluded(ta)) {
-      showNotify('この欄には挿入できません（管理者用）', 'error');
-      logger.error('挿入失敗: 除外対象');
-      return false;
-    }
-    
-    // 既存テキストチェック
-    const currentValue = ta.tagName === 'TEXTAREA' || ta.tagName === 'INPUT'
-      ? ta.value
-      : ta.textContent || ta.innerHTML;
-    if (currentValue && currentValue.trim().length > 0) {
-      showNotify('既にテキストが入力されています。上書きしません。', 'warn');
-      logger.warn('挿入スキップ: 既存テキストあり', currentValue.substring(0, 50));
-      return false;
-    }
-    
+    const el = state.textarea.element;
+    if (!el) { showNotify('返信欄が見つかりません', 'error'); return false; }
+    if (isExcludedTextarea(el)) { showNotify('この欄には挿入できません', 'error'); return false; }
+    const cur = (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') ? el.value : (el.textContent || el.innerHTML || '');
+    if (cur && cur.length > 0) { showNotify('既にテキストが入力されています', 'warn'); return false; }
     try {
-      if (ta.tagName === 'TEXTAREA' || ta.tagName === 'INPUT') {
-        ta.value = text;
-        ta.dispatchEvent(new Event('input', { bubbles: true }));
-        ta.dispatchEvent(new Event('change', { bubbles: true }));
-      } else if (ta.contentEditable === 'true' || ta.tagName === 'BODY') {
-        ta.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
-        ta.dispatchEvent(new Event('input', { bubbles: true }));
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        el.value = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
       }
-      ta.focus();
+      el.focus();
       showNotify('挿入しました', 'success');
-      logger.info('テキスト挿入完了');
       return true;
-    } catch (e) {
-      showNotify('挿入に失敗しました', 'error');
-      logger.error('挿入エラー', e);
-      return false;
-    }
+    } catch (e) { showNotify('挿入失敗', 'error'); return false; }
   }
 
   // ============================================================
-  // Google Sheet
+  // Google Sheet（GM_xmlhttpRequest でCORS回避）
   // ============================================================
   function normalizeSheetUrl(url) {
     if (!url) return null;
@@ -488,32 +397,31 @@
     if (u.includes('/export?format=csv') || u.includes('output=csv') || u.includes('/gviz/tq')) return u;
     const m = u.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
     if (m) {
-      const id = m[1];
       const gidM = u.match(/gid=(\d+)/);
-      const gid = gidM ? gidM[1] : '0';
-      return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
+      return `https://docs.google.com/spreadsheets/d/${m[1]}/export?format=csv&gid=${gidM ? gidM[1] : '0'}`;
     }
     return u;
   }
 
   function parseCsv(csv) {
     return csv.split('\n').map(line => {
-      line = line.trim();
-      if (!line) return null;
-      if (line.startsWith('"')) {
-        const end = line.indexOf('",');
-        if (end > 0) return line.substring(1, end).replace(/""/g, '"');
-        if (line.endsWith('"')) return line.slice(1, -1).replace(/""/g, '"');
+      const t = line.trim();
+      if (!t) return null;
+      if (t.startsWith('"')) {
+        const end = t.indexOf('",');
+        if (end > 0) return t.substring(1, end).replace(/""/g, '"');
+        if (t.endsWith('"')) return t.slice(1, -1).replace(/""/g, '"');
       }
-      const comma = line.indexOf(',');
-      return comma > 0 ? line.substring(0, comma) : line;
-    }).filter(Boolean);
+      const c = t.indexOf(',');
+      return c > 0 ? t.substring(0, c) : t;
+    }).filter(Boolean).map(s => s.trim()).filter(Boolean);
   }
 
-  async function fetchSheet(url) {
+  function fetchSheet(url) {
     state.sheetStatus = 'loading';
     state.sheetError = null;
     updateUI();
+
     const normalized = normalizeSheetUrl(url);
     if (!normalized) {
       state.sheetStatus = 'error';
@@ -521,72 +429,105 @@
       updateUI();
       return;
     }
+
     logger.info('Sheet読み込み開始', normalized);
-    try {
-      const res = await fetch(normalized, { method: 'GET', mode: 'cors', credentials: 'omit' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const csv = await res.text();
-      const msgs = parseCsv(csv);
-      if (msgs.length === 0) throw new Error('データがありません');
-      state.messages = msgs;
-      state.sheetUrl = url;
-      state.sheetStatus = 'success';
-      storageSet('sheetUrl', url);
-      storageSet('messages', msgs);
-      logger.info(`Sheet読み込み成功: ${msgs.length}件`);
-      showNotify(`${msgs.length}件読み込み`, 'success');
-    } catch (e) {
-      state.sheetStatus = 'error';
-      if (e.message.includes('Failed to fetch')) {
-        state.sheetError = 'CORSエラー: シートを「リンクを知っている全員」に公開してください';
-      } else if (e.message.includes('403')) {
-        state.sheetError = '権限エラー(403): 公開設定を確認してください';
-      } else if (e.message.includes('404')) {
-        state.sheetError = 'シート未発見(404): URLを確認してください';
-      } else {
-        state.sheetError = e.message;
-      }
-      logger.error('Sheet読み込み失敗', e);
+
+    // GM_xmlhttpRequest があれば使う（CORS回避）
+    if (typeof GM_xmlhttpRequest !== 'undefined') {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: normalized,
+        timeout: 15000,
+        onload: function(res) {
+          if (res.status >= 200 && res.status < 300) {
+            const msgs = parseCsv(res.responseText);
+            if (msgs.length === 0) {
+              state.sheetStatus = 'error';
+              state.sheetError = 'データがありません';
+            } else {
+              state.messages = msgs;
+              state.sheetUrl = url;
+              state.sheetStatus = 'success';
+              storageSet('sheetUrl', url);
+              storageSet('messages', msgs);
+              showNotify(`${msgs.length}件読み込み`, 'success');
+              logger.info(`Sheet読み込み成功: ${msgs.length}件`);
+            }
+          } else if (res.status === 403) {
+            state.sheetStatus = 'error';
+            state.sheetError = '権限エラー(403): シートを「リンクを知っている全員」に公開してください';
+          } else if (res.status === 404) {
+            state.sheetStatus = 'error';
+            state.sheetError = 'シート未発見(404): URLを確認してください';
+          } else {
+            state.sheetStatus = 'error';
+            state.sheetError = `HTTPエラー: ${res.status}`;
+          }
+          updateUI();
+        },
+        onerror: function() {
+          state.sheetStatus = 'error';
+          state.sheetError = 'ネットワークエラー';
+          updateUI();
+        },
+        ontimeout: function() {
+          state.sheetStatus = 'error';
+          state.sheetError = 'タイムアウト';
+          updateUI();
+        },
+      });
+    } else {
+      // fallback: fetch（CORSで失敗する可能性あり）
+      fetch(normalized, { method: 'GET', mode: 'cors', credentials: 'omit' })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
+        .then(csv => {
+          const msgs = parseCsv(csv);
+          if (msgs.length === 0) throw new Error('データがありません');
+          state.messages = msgs;
+          state.sheetUrl = url;
+          state.sheetStatus = 'success';
+          storageSet('sheetUrl', url);
+          storageSet('messages', msgs);
+          showNotify(`${msgs.length}件読み込み`, 'success');
+        })
+        .catch(e => {
+          state.sheetStatus = 'error';
+          state.sheetError = e.message.includes('Failed to fetch') ? 'CORSエラー: 直接入力を使用してください' : e.message;
+        })
+        .finally(() => updateUI());
     }
-    updateUI();
   }
 
   // ============================================================
   // 通知
   // ============================================================
-  function showNotify(msg, type = 'info') {
+  function showNotify(msg, type) {
     const old = $('#dating-ops-notify');
     if (old) old.remove();
     const colors = { info: '#4a90d9', success: '#48bb78', warn: '#f6ad55', error: '#fc8181' };
     const el = document.createElement('div');
     el.id = 'dating-ops-notify';
+    el.textContent = msg;
     Object.assign(el.style, {
       position: 'fixed', bottom: '20px', right: '20px', padding: '10px 16px',
       background: colors[type] || colors.info, color: '#fff', borderRadius: '6px',
       boxShadow: '0 4px 12px rgba(0,0,0,0.3)', zIndex: '2147483647',
-      fontSize: '13px', fontFamily: 'system-ui, sans-serif', maxWidth: '280px',
+      fontSize: '13px', fontFamily: 'system-ui, sans-serif', maxWidth: '300px',
     });
-    el.textContent = msg;
     document.body.appendChild(el);
-    setTimeout(() => {
-      el.style.transition = 'opacity 0.3s';
-      el.style.opacity = '0';
-      setTimeout(() => el.remove(), 300);
-    }, 3500);
+    setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.3s'; setTimeout(() => el.remove(), 300); }, 3500);
   }
 
   // ============================================================
-  // パネルUI
+  // パネル UI
   // ============================================================
   function createStyles() {
     if ($('#dating-ops-styles')) return;
-    const cfg = state.config;
-    const primary = cfg?.ui?.primaryColor || '#4a90d9';
-    const accent = cfg?.ui?.accentColor || '#2c5282';
+    const p = CONFIG.ui.primaryColor, a = CONFIG.ui.accentColor;
     const css = `
-      #${PANEL_ID}{position:fixed;width:320px;max-height:85vh;background:#1e1e2e;border:1px solid ${primary};border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:2147483646;font-family:system-ui,sans-serif;font-size:13px;color:#cdd6f4;overflow:hidden}
+      #${PANEL_ID}{position:fixed;width:350px;max-height:85vh;background:#1e1e2e;border:1px solid ${p};border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:2147483646;font-family:system-ui,sans-serif;font-size:13px;color:#cdd6f4;overflow:hidden}
       #${PANEL_ID} *{box-sizing:border-box}
-      #${PANEL_ID} .header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:linear-gradient(135deg,${primary},${accent});cursor:move;user-select:none}
+      #${PANEL_ID} .header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:linear-gradient(135deg,${p},${a});cursor:move;user-select:none}
       #${PANEL_ID} .header-title{font-weight:600;color:#fff}
       #${PANEL_ID} .header-close{width:22px;height:22px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.2);border:none;border-radius:4px;color:#fff;cursor:pointer;font-size:14px}
       #${PANEL_ID} .header-close:hover{background:rgba(255,255,255,0.3)}
@@ -597,132 +538,123 @@
       #${PANEL_ID} .status-row{display:flex;justify-content:space-between;margin-bottom:4px}
       #${PANEL_ID} .status-row:last-child{margin-bottom:0}
       #${PANEL_ID} .status-label{color:#6c7086}
-      #${PANEL_ID} .status-val{font-weight:500}
+      #${PANEL_ID} .status-val{font-weight:500;text-align:right;max-width:180px;overflow:hidden;text-overflow:ellipsis}
       #${PANEL_ID} .st-ok{color:#a6e3a1}
       #${PANEL_ID} .st-warn{color:#f9e2af}
       #${PANEL_ID} .st-err{color:#f38ba8}
       #${PANEL_ID} .st-info{color:#89b4fa}
-      #${PANEL_ID} input,#${PANEL_ID} textarea{width:100%;padding:7px 9px;background:#313244;border:1px solid #45475a;border-radius:4px;color:#cdd6f4;font-size:12px;font-family:inherit}
-      #${PANEL_ID} input:focus,#${PANEL_ID} textarea:focus{outline:none;border-color:${primary}}
+      #${PANEL_ID} input,#${PANEL_ID} textarea{width:100%;padding:7px 9px;background:#313244;border:1px solid #45475a;border-radius:4px;color:#cdd6f4;font-size:12px}
+      #${PANEL_ID} input:focus,#${PANEL_ID} textarea:focus{outline:none;border-color:${p}}
       #${PANEL_ID} textarea{resize:vertical;min-height:60px;max-height:120px}
       #${PANEL_ID} .btn-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
       #${PANEL_ID} .btn{padding:6px 10px;border:none;border-radius:4px;font-size:11px;font-weight:500;cursor:pointer}
-      #${PANEL_ID} .btn-pri{background:${primary};color:#fff}
-      #${PANEL_ID} .btn-pri:hover{background:${accent}}
+      #${PANEL_ID} .btn-pri{background:${p};color:#fff}
+      #${PANEL_ID} .btn-pri:hover{background:${a}}
       #${PANEL_ID} .btn-sec{background:#45475a;color:#cdd6f4}
       #${PANEL_ID} .btn-sec:hover{background:#585b70}
       #${PANEL_ID} .btn-red{background:#f38ba8;color:#1e1e2e}
-      #${PANEL_ID} .btn-red:hover{background:#eba0ac}
-      #${PANEL_ID} .msg-list{max-height:130px;overflow-y:auto;background:#313244;border-radius:4px}
+      #${PANEL_ID} .msg-list{max-height:120px;overflow-y:auto;background:#313244;border-radius:4px}
       #${PANEL_ID} .msg-item{padding:6px 8px;border-bottom:1px solid #45475a;cursor:pointer;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #${PANEL_ID} .msg-item:last-child{border-bottom:none}
       #${PANEL_ID} .msg-item:hover{background:#45475a}
-      #${PANEL_ID} .error-box{background:rgba(243,139,168,0.15);border:1px solid #f38ba8;border-radius:4px;padding:8px;font-size:11px;color:#f38ba8;margin-bottom:10px;white-space:pre-wrap}
+      #${PANEL_ID} .error-box{background:rgba(243,139,168,0.15);border:1px solid #f38ba8;border-radius:4px;padding:8px;font-size:11px;color:#f38ba8;margin-bottom:10px}
+      #${PANEL_ID} .warn-box{background:rgba(249,226,175,0.15);border:1px solid #f9e2af;border-radius:4px;padding:8px;font-size:11px;color:#f9e2af;margin-bottom:10px}
       #${PANEL_ID} .help{font-size:10px;color:#6c7086;margin-top:4px}
-      #${PANEL_ID} .detail-box{background:#45475a;border-radius:4px;padding:6px;font-size:10px;color:#a6adc8;margin-top:6px;word-break:break-all}
+      #${PANEL_ID} details{margin-top:6px}
+      #${PANEL_ID} summary{cursor:pointer;font-size:10px;color:#6c7086}
+      #${PANEL_ID} .detail-box{background:#45475a;border-radius:4px;padding:6px;font-size:10px;color:#a6adc8;margin-top:4px}
       #${PANEL_ID} .detail-box .label{color:#6c7086}
     `;
-    const style = document.createElement('style');
-    style.id = 'dating-ops-styles';
-    style.textContent = css;
-    document.head.appendChild(style);
+    const s = document.createElement('style');
+    s.id = 'dating-ops-styles';
+    s.textContent = css;
+    document.head.appendChild(s);
   }
 
-  function createPanelHtml() {
-    const cfg = state.config;
-    const title = cfg?.ui?.title || 'Dating Ops';
-    const taInfo = state.textareaInfo;
-    const rowInfo = state.rowInfo;
-    
-    // 返信欄ステータス
-    let taStatusText, taStatusClass;
-    if (taInfo.status === 'found') {
-      taStatusText = taInfo.where === 'iframe' ? `iframe内OK` : '検出OK';
-      taStatusClass = 'st-ok';
-    } else if (taInfo.status === 'not_found') {
-      taStatusText = '未検出';
-      taStatusClass = 'st-warn';
-    } else if (taInfo.status === 'error') {
-      taStatusText = 'エラー';
-      taStatusClass = 'st-err';
-    } else {
-      taStatusText = '未確認';
-      taStatusClass = 'st-warn';
-    }
-    
-    // 行ステータス
-    let rowStatusText, rowStatusClass;
-    if (rowInfo.displayCount > 0) {
-      rowStatusText = `${rowInfo.displayCount}件`;
-      if (rowInfo.checkedCount > 0) {
-        rowStatusText += ` (✓${rowInfo.checkedCount})`;
-      }
-      rowStatusClass = 'st-ok';
-    } else {
-      rowStatusText = '0件';
-      rowStatusClass = 'st-warn';
-    }
-    
-    // Sheet ステータス
-    const sheetStatusText = { idle: '未設定', loading: '読込中...', success: `${state.messages.length}件`, error: 'エラー' }[state.sheetStatus] || '不明';
-    const sheetStatusClass = { idle: 'st-warn', loading: 'st-info', success: 'st-ok', error: 'st-err' }[state.sheetStatus] || 'st-warn';
+  function buildPanelHtml() {
+    const pm = state.pageMode;
+    const r = state.rows;
+    const t = state.textarea;
 
-    // 詳細情報
-    let detailHtml = '';
-    if (taInfo.selector) {
-      detailHtml += `<div><span class="label">セレクタ:</span> ${escapeHtml(taInfo.selector)}</div>`;
+    // mode表示
+    const modeText = pm === 'list' ? '一括送信' : pm === 'personal' ? '個別送信' : 'その他';
+    const modeClass = pm === 'list' ? 'st-info' : pm === 'personal' ? 'st-ok' : 'st-warn';
+
+    // 行数表示
+    let rowText, rowClass;
+    if (pm === 'personal') {
+      rowText = '1 (個別送信ページ)';
+      rowClass = 'st-ok';
+    } else if (pm === 'list') {
+      rowText = r.count > 0 ? `${r.count}行` : '0行';
+      rowClass = r.count > 0 ? 'st-ok' : 'st-warn';
+    } else {
+      rowText = '-';
+      rowClass = 'st-info';
     }
-    if (taInfo.where === 'iframe' && taInfo.iframeSrc) {
-      detailHtml += `<div><span class="label">iframe:</span> ${escapeHtml(taInfo.iframeSrc)}</div>`;
+
+    // 返信欄
+    let taText, taClass;
+    if (t.status === 'found') {
+      taText = `${t.selector} (${t.where})`;
+      taClass = 'st-ok';
+    } else {
+      taText = '未検出';
+      taClass = 'st-warn';
     }
-    if (taInfo.reason) {
-      detailHtml += `<div><span class="label">理由:</span> ${escapeHtml(taInfo.reason)}</div>`;
-    }
-    if (rowInfo.selectorHit) {
-      detailHtml += `<div><span class="label">行セレクタ:</span> ${escapeHtml(rowInfo.selectorHit)}</div>`;
-    }
+
+    // Sheet
+    const sheetMap = { idle: { t: '未設定', c: 'st-warn' }, loading: { t: '読込中...', c: 'st-info' }, success: { t: `${state.messages.length}件`, c: 'st-ok' }, error: { t: 'エラー', c: 'st-err' } };
+    const sh = sheetMap[state.sheetStatus] || sheetMap.idle;
+
+    // 詳細
+    let detail = `<div><span class="label">最終検出:</span> ${formatTime(state.lastDetectTime)}</div>`;
+    detail += `<div><span class="label">トリガ:</span> ${state.lastTrigger || '-'}</div>`;
+    detail += `<div><span class="label">scope:</span> ${escapeHtml(r.scopeHint || '-')}</div>`;
+    detail += `<div><span class="label">行セレクタ:</span> ${escapeHtml(r.usedSelector || '-')}</div>`;
+    if (t.iframeSrc) detail += `<div><span class="label">iframe:</span> ${escapeHtml(t.iframeSrc)}</div>`;
+    if (state.observeTargetHint) detail += `<div><span class="label">監視:</span> ${escapeHtml(state.observeTargetHint)}</div>`;
+
+    // 警告
+    let warn = '';
+    if (r.mismatchWarning) warn = `<div class="warn-box">⚠️ ${escapeHtml(r.mismatchWarning)}</div>`;
+
+    // メッセージ
+    const msgHtml = state.messages.length > 0
+      ? state.messages.map((m, i) => `<div class="msg-item" data-idx="${i}" title="${escapeHtml(m)}">${escapeHtml(m.length > 40 ? m.substring(0, 40) + '...' : m)}</div>`).join('')
+      : '<div class="msg-item" style="color:#6c7086;">メッセージなし</div>';
 
     return `
-      <div class="header">
-        <span class="header-title">${escapeHtml(title)}</span>
-        <button class="header-close" id="dp-close" title="閉じる">✕</button>
-      </div>
+      <div class="header"><span class="header-title">${escapeHtml(CONFIG.ui.title)}</span><button class="header-close" id="dp-close">✕</button></div>
       <div class="body">
+        ${warn}
         <div class="section">
           <div class="section-title">ステータス</div>
           <div class="status-box">
-            <div class="status-row"><span class="status-label">サイト:</span><span class="status-val st-info">${state.siteType.toUpperCase()}</span></div>
-            <div class="status-row"><span class="status-label">返信欄:</span><span class="status-val ${taStatusClass}">${taStatusText}</span></div>
-            <div class="status-row"><span class="status-label">表示行:</span><span class="status-val ${rowStatusClass}">${rowStatusText}</span></div>
-            <div class="status-row"><span class="status-label">Sheet:</span><span class="status-val ${sheetStatusClass}">${sheetStatusText}</span></div>
+            <div class="status-row"><span class="status-label">モード:</span><span class="status-val ${modeClass}">${modeText}</span></div>
+            <div class="status-row"><span class="status-label">行数:</span><span class="status-val ${rowClass}">${rowText}</span></div>
+            <div class="status-row"><span class="status-label">返信欄:</span><span class="status-val ${taClass}">${taText}</span></div>
+            <div class="status-row"><span class="status-label">Sheet:</span><span class="status-val ${sh.c}">${sh.t}</span></div>
           </div>
-          ${detailHtml ? `<div class="detail-box">${detailHtml}</div>` : ''}
+          <details><summary>詳細情報</summary><div class="detail-box">${detail}</div></details>
         </div>
         ${state.sheetError ? `<div class="error-box">${escapeHtml(state.sheetError)}</div>` : ''}
         <div class="section">
           <div class="section-title">Google Sheet</div>
-          <input type="text" id="dp-sheet-url" placeholder="https://docs.google.com/spreadsheets/d/..." value="${escapeHtml(state.sheetUrl || '')}">
+          <input type="text" id="dp-sheet-url" placeholder="https://docs.google.com/spreadsheets/d/..." value="${escapeHtml(state.sheetUrl)}">
           <div class="help">シートを「リンクを知っている全員」に公開</div>
-          <div class="btn-row">
-            <button class="btn btn-pri" id="dp-load-sheet">Sheet読込</button>
-            <button class="btn btn-sec" id="dp-rescan">再検出</button>
-          </div>
+          <div class="btn-row"><button class="btn btn-pri" id="dp-load-sheet">Sheet読込</button><button class="btn btn-sec" id="dp-rescan">再検出</button></div>
         </div>
         <div class="section">
-          <div class="section-title">直接入力（1行=1メッセージ）</div>
-          <textarea id="dp-direct" placeholder="メッセージを1行ずつ..."></textarea>
+          <div class="section-title">直接入力</div>
+          <textarea id="dp-direct" placeholder="メッセージを1行ずつ入力..."></textarea>
           <div class="btn-row"><button class="btn btn-pri" id="dp-apply-direct">適用</button></div>
         </div>
         <div class="section">
-          <div class="section-title">メッセージ一覧 (${state.messages.length}件)</div>
-          <div class="msg-list" id="dp-msg-list">
-            ${state.messages.length > 0 ? state.messages.map((m, i) => `<div class="msg-item" data-idx="${i}" title="${escapeHtml(m)}">${escapeHtml(m.substring(0, 45))}${m.length > 45 ? '...' : ''}</div>`).join('') : '<div class="msg-item" style="color:#6c7086;">メッセージなし</div>'}
-          </div>
+          <div class="section-title">メッセージ (${state.messages.length}件)</div>
+          <div class="msg-list" id="dp-msg-list">${msgHtml}</div>
         </div>
-        <div class="btn-row">
-          <button class="btn btn-red" id="dp-stop">${state.stopped ? '停止中' : '停止'}</button>
-          <button class="btn btn-sec" id="dp-diag">診断</button>
-        </div>
+        <div class="btn-row"><button class="btn btn-red" id="dp-stop">${state.stopped ? '停止中' : '停止'}</button><button class="btn btn-sec" id="dp-diag">診断</button></div>
       </div>
     `;
   }
@@ -733,60 +665,50 @@
     createStyles();
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
-    panel.innerHTML = createPanelHtml();
-    const savedPos = storageGet('panelPos');
-    if (savedPos) state.panelPos = savedPos;
+    panel.innerHTML = buildPanelHtml();
+    const pos = storageGet('panelPos', null);
+    if (pos) state.panelPos = pos;
     panel.style.left = `${state.panelPos.x}px`;
     panel.style.top = `${state.panelPos.y}px`;
     document.body.appendChild(panel);
     state.panel = panel;
-    setupPanelEvents();
-    logger.info('パネル作成完了');
+    bindPanelEvents();
   }
 
-  function setupPanelEvents() {
-    const panel = state.panel;
-    if (!panel) return;
-    const header = panel.querySelector('.header');
-    if (header) header.addEventListener('mousedown', onDragStart);
-    const closeBtn = panel.querySelector('#dp-close');
-    if (closeBtn) closeBtn.addEventListener('click', () => { panel.style.display = 'none'; logger.info('パネルを閉じました'); });
-    const loadBtn = panel.querySelector('#dp-load-sheet');
-    if (loadBtn) loadBtn.addEventListener('click', () => {
-      const url = panel.querySelector('#dp-sheet-url')?.value?.trim();
-      if (url) fetchSheet(url); else showNotify('URLを入力してください', 'warn');
+  function bindPanelEvents() {
+    const p = state.panel;
+    if (!p) return;
+    p.querySelector('.header')?.addEventListener('mousedown', onDragStart);
+    p.querySelector('#dp-close')?.addEventListener('click', () => p.style.display = 'none');
+    p.querySelector('#dp-load-sheet')?.addEventListener('click', () => {
+      const url = p.querySelector('#dp-sheet-url')?.value?.trim();
+      url ? fetchSheet(url) : showNotify('URLを入力', 'warn');
     });
-    const rescanBtn = panel.querySelector('#dp-rescan');
-    if (rescanBtn) rescanBtn.addEventListener('click', () => { detectAllWithRetry(); panel.style.display = ''; showNotify('再検出開始', 'info'); });
-    const applyBtn = panel.querySelector('#dp-apply-direct');
-    if (applyBtn) applyBtn.addEventListener('click', () => {
-      const text = panel.querySelector('#dp-direct')?.value?.trim();
-      if (!text) { showNotify('テキストを入力してください', 'warn'); return; }
-      const msgs = text.split('\n').filter(l => l.trim());
-      if (msgs.length === 0) { showNotify('有効なメッセージがありません', 'warn'); return; }
+    p.querySelector('#dp-rescan')?.addEventListener('click', () => { showNotify('再検出', 'info'); runDetection('manual'); });
+    p.querySelector('#dp-apply-direct')?.addEventListener('click', () => {
+      const txt = p.querySelector('#dp-direct')?.value?.trim();
+      if (!txt) { showNotify('テキストを入力', 'warn'); return; }
+      const msgs = txt.split('\n').map(l => l.trim()).filter(Boolean);
+      if (msgs.length === 0) { showNotify('有効なメッセージなし', 'warn'); return; }
       state.messages = msgs;
       storageSet('messages', msgs);
+      state.sheetStatus = 'success';
       showNotify(`${msgs.length}件適用`, 'success');
       updateUI();
     });
-    const stopBtn = panel.querySelector('#dp-stop');
-    if (stopBtn) stopBtn.addEventListener('click', () => {
+    p.querySelector('#dp-stop')?.addEventListener('click', () => {
       state.stopped = true;
-      if (state.observer) { state.observer.disconnect(); state.observer = null; }
-      if (state.healthTimer) { clearInterval(state.healthTimer); state.healthTimer = null; }
-      clearTimeout(state.detectTimer);
-      logger.info('完全停止');
-      showNotify('監視を停止しました', 'warn');
+      state.observer?.disconnect();
+      clearInterval(state.healthTimer);
+      clearInterval(state.urlPollTimer);
+      clearTimeout(state.stagedDetectTimer);
+      showNotify('停止しました', 'warn');
       updateUI();
     });
-    const diagBtn = panel.querySelector('#dp-diag');
-    if (diagBtn) diagBtn.addEventListener('click', runDiagnostic);
-    const msgList = panel.querySelector('#dp-msg-list');
-    if (msgList) msgList.addEventListener('click', (e) => {
+    p.querySelector('#dp-diag')?.addEventListener('click', runDiagnostic);
+    p.querySelector('#dp-msg-list')?.addEventListener('click', e => {
       const item = e.target.closest('.msg-item');
-      if (!item) return;
-      const idx = parseInt(item.dataset.idx, 10);
-      if (!isNaN(idx) && state.messages[idx]) insertText(state.messages[idx]);
+      if (item) { const i = parseInt(item.dataset.idx, 10); if (!isNaN(i) && state.messages[i]) insertText(state.messages[i]); }
     });
     document.addEventListener('mousemove', onDragMove);
     document.addEventListener('mouseup', onDragEnd);
@@ -798,116 +720,129 @@
     state.dragOffset = { x: e.clientX - state.panelPos.x, y: e.clientY - state.panelPos.y };
     if (state.panel) state.panel.style.transition = 'none';
   }
-
   function onDragMove(e) {
     if (!state.dragging || !state.panel) return;
-    const x = Math.max(0, Math.min(window.innerWidth - 320, e.clientX - state.dragOffset.x));
-    const y = Math.max(0, Math.min(window.innerHeight - 50, e.clientY - state.dragOffset.y));
-    state.panelPos = { x, y };
-    state.panel.style.left = `${x}px`;
-    state.panel.style.top = `${y}px`;
+    state.panelPos = { x: Math.max(0, Math.min(window.innerWidth - 350, e.clientX - state.dragOffset.x)), y: Math.max(0, Math.min(window.innerHeight - 50, e.clientY - state.dragOffset.y)) };
+    state.panel.style.left = `${state.panelPos.x}px`;
+    state.panel.style.top = `${state.panelPos.y}px`;
   }
-
   function onDragEnd() {
     if (!state.dragging) return;
     state.dragging = false;
     storageSet('panelPos', state.panelPos);
     if (state.panel) state.panel.style.transition = '';
   }
-
-  function updateUI() {
-    const panel = state.panel;
-    if (!panel) return;
-    panel.innerHTML = createPanelHtml();
-    setupPanelEvents();
+  function updateUI() { if (state.panel) { state.panel.innerHTML = buildPanelHtml(); bindPanelEvents(); } }
+  function runDiagnostic() {
+    const d = { siteType: SITE_TYPE, version: '2.3.0', pageMode: state.pageMode, textarea: state.textarea, rows: state.rows, lastDetectTime: state.lastDetectTime, lastTrigger: state.lastTrigger, messages: state.messages.length, sheetStatus: state.sheetStatus, sheetError: state.sheetError, url: location.href };
+    console.group('%c[DatingOps] 診断', 'color:#4a90d9;font-weight:bold'); console.log(d); console.groupEnd();
+    navigator.clipboard?.writeText(JSON.stringify(d, null, 2)).then(() => showNotify('診断情報コピー', 'info')).catch(() => {});
+    return d;
   }
 
-  function runDiagnostic() {
-    const diag = {
-      siteType: state.siteType,
-      stopped: state.stopped,
-      initialized: state.initialized,
-      textarea: {
-        status: state.textareaInfo.status,
-        selector: state.textareaInfo.selector,
-        where: state.textareaInfo.where,
-        iframeSrc: state.textareaInfo.iframeSrc,
-        reason: state.textareaInfo.reason,
-        hasElement: !!state.textareaInfo.element,
-      },
-      rows: state.rowInfo,
-      messages: state.messages.length,
-      sheetStatus: state.sheetStatus,
-      sheetError: state.sheetError,
-      url: location.href,
-      allTextareas: $$('textarea', document).map(t => ({ name: t.name, id: t.id, class: t.className })),
-    };
-    console.group('%c[DatingOps] 診断情報', 'color:#4a90d9;font-weight:bold');
-    console.log(diag);
-    console.log('設定:', state.config);
-    console.groupEnd();
-    navigator.clipboard?.writeText(JSON.stringify(diag, null, 2))
-      .then(() => showNotify('診断情報をコピーしました', 'info'))
-      .catch(() => showNotify('診断情報をコンソールに出力しました', 'info'));
-    return diag;
+  // ============================================================
+  // トリガイベント
+  // ============================================================
+  function bindTriggerEvents() {
+    const debouncedDetect = debounce(trigger => runDetection(trigger), OBSERVER_DEBOUNCE_MS);
+    document.addEventListener('click', e => {
+      if (state.stopped || !e.target || e.target.closest(`#${PANEL_ID}`)) return;
+      for (const sel of CONFIG.clickTriggerSelectors) {
+        try { if (e.target.matches(sel) || e.target.closest(sel)) { debouncedDetect('click'); return; } } catch {}
+      }
+    }, true);
+    document.addEventListener('change', e => {
+      if (state.stopped || !e.target || e.target.tagName !== 'SELECT' || e.target.closest(`#${PANEL_ID}`)) return;
+      for (const sel of CONFIG.changeTriggerSelectors) {
+        try { if (e.target.matches(sel)) { debouncedDetect('change'); return; } } catch {}
+      }
+    }, true);
+  }
+
+  // ============================================================
+  // MutationObserver
+  // ============================================================
+  function findObserveTarget() {
+    for (const sel of CONFIG.listAreaSelectors) { const el = $(sel); if (el) return { target: el, hint: sel }; }
+    const scope = findRowScope();
+    if (scope.el !== document.body) return { target: scope.el, hint: `scope: ${scope.hint}` };
+    return { target: document.body, hint: 'body (fallback)' };
   }
 
   function startObserver() {
-    if (state.observer) state.observer.disconnect();
-    const handler = debounce(() => {
-      if (state.stopped) return;
-      ensurePanel();
-      detectAllWithRetry();
-    }, OBSERVER_DEBOUNCE_MS);
-    state.observer = new MutationObserver((muts) => {
-      const isOwn = muts.some(m => m.target.id === PANEL_ID || m.target.closest?.(`#${PANEL_ID}`));
-      if (isOwn) return;
+    state.observer?.disconnect();
+    const info = findObserveTarget();
+    state.observeTargetHint = info.hint;
+    if (info.target === document.body) logger.warn('一覧領域特定できず、bodyを監視');
+    else logger.info(`監視対象: ${info.hint}`);
+    const handler = debounce(() => { if (!state.stopped) runDetection('mutation'); }, OBSERVER_DEBOUNCE_MS);
+    state.observer = new MutationObserver(muts => {
+      if (muts.some(m => m.target.id === PANEL_ID || m.target.closest?.(`#${PANEL_ID}`))) return;
       handler();
     });
-    state.observer.observe(document.body, { childList: true, subtree: true });
-    logger.info('DOM監視開始');
+    state.observer.observe(info.target, { childList: true, subtree: true });
   }
 
-  function ensurePanel() {
+  // ============================================================
+  // URL変化検知
+  // ============================================================
+  function setupUrlChangeDetection() {
+    state.lastUrl = location.href;
+    // history hook
+    const wrap = fn => function() { const r = fn.apply(this, arguments); onUrlChange('history'); return r; };
+    history.pushState = wrap(history.pushState);
+    history.replaceState = wrap(history.replaceState);
+    window.addEventListener('popstate', () => onUrlChange('popstate'));
+    // polling
+    state.urlPollTimer = setInterval(() => { if (location.href !== state.lastUrl) onUrlChange('poll'); }, URL_POLL_MS);
+  }
+
+  function onUrlChange(src) {
     if (state.stopped) return;
-    const panel = $(`#${PANEL_ID}`);
-    if (!panel) { logger.warn('パネル消失、再作成'); createPanel(); }
-    else state.panel = panel;
+    state.lastUrl = location.href;
+    logger.info(`URL変化検知 (${src})`);
+    startObserver();
+    runStagedDetection();
   }
 
+  // ============================================================
+  // ヘルスチェック
+  // ============================================================
   function startHealthCheck() {
-    if (state.healthTimer) clearInterval(state.healthTimer);
     state.healthTimer = setInterval(() => {
       if (state.stopped) { clearInterval(state.healthTimer); return; }
-      ensurePanel();
+      if (!$(`#${PANEL_ID}`)) createPanel();
+      const pm = state.pageMode;
+      const taOk = state.textarea.status === 'found';
+      const rowsOk = pm === 'personal' || state.rows.count > 0;
+      if (!taOk || (pm === 'list' && !rowsOk)) {
+        logger.info('ヘルスチェック: 再検出');
+        runDetection('health');
+      }
     }, HEALTH_CHECK_MS);
   }
 
+  // ============================================================
+  // 初期化
+  // ============================================================
   function init() {
-    if (state.initialized) { logger.warn('既に初期化済み'); return; }
-    state.config = getConfig('olv');
-    if (!state.config) { logger.error('設定が見つかりません'); return; }
-    if (!shouldShowPanel('olv', location.pathname)) { logger.info('パネル非表示ページ', location.pathname); return; }
-    logger.info('初期化開始: olv');
+    if (state.initialized || !location.pathname.includes('/staff/')) return;
+    logger.info('初期化開始');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';
+    state.pageMode = detectPageMode();
     createPanel();
-    detectAllWithRetry();
+    bindTriggerEvents();
     startObserver();
+    setupUrlChangeDetection();
     startHealthCheck();
+    runStagedDetection();
     state.initialized = true;
-    window.__datingOps = { state, diag: runDiagnostic, stop: () => { state.stopped = true; }, rescan: detectAllWithRetry, insert: insertText, fetchSheet };
+    window.__datingOps = { state, diag: runDiagnostic, rescan: () => runDetection('manual'), insert: insertText, fetchSheet };
     logger.info('初期化完了');
   }
 
-  // ============================================================
-  // 起動
-  // ============================================================
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
-
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
 })();
