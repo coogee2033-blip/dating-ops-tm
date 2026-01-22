@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Dating Ops - MEM
 // @namespace    dating-ops-tm
-// @version      2.3.0
-// @description  MEM (mem44.com) サイト用返信アシストツール - list/personal対応 + CORS回避版
+// @version      2.3.1
+// @description  MEM (mem44.com) 返信アシスト - list scope fix + robust table detection
 // @author       Dating Ops Team
 // @match        https://mem44.com/staff/*
 // @match        https://*.mem44.com/staff/*
@@ -16,27 +16,19 @@
 
 /**
  * ============================================================
- * 実装メモ (v2.3.0)
+ * 実装メモ (v2.3.1)
  * ============================================================
  * 
- * 【ページモード判定】
- *   - /staff/index → mode="list"（一括送信）
- *   - /staff/personalbox → mode="personal"（個別送信）
- *   - その他 → mode="other"
- * 
- * 【行検出】
- *   - mode=list のみ実施
- *   - scope特定: td.chatview → tr.rowitem → checkbox領域 → fallback
- *   - isVisible は行検出では使わない（0化事故防止）
+ * 【行検出 - スコアリング方式】
+ *   - getAllTables() で全table取得
+ *   - scoreListTable() で各tableをスコアリング
+ *   - findBestListTable() で最高スコアのtableを選択
+ *   - score基準: 行数, checkbox, ヘッダーキーワード
  * 
  * 【返信欄検出】
- *   - 全モードで実施
- *   - 優先順: message1 → msg.wd100 → msg → message → mail_body → content
- *   - 除外: memo/admin/note/futari/two_memo/staff
- * 
- * 【Google Sheet】
- *   - GM_xmlhttpRequest でCORS回避
- *   - エラー時は種別表示 + 直接入力フォールバック
+ *   - textarea[name="message1"] 最優先
+ *   - memo/admin/note/futari/two_memo/staff 除外
+ *   - 既存テキストがあれば上書き禁止
  * ============================================================
  */
 
@@ -53,21 +45,17 @@
   const OBSERVER_DEBOUNCE_MS = 300;
   const HEALTH_CHECK_MS = 3000;
   const URL_POLL_MS = 500;
-
-  // 段階的検出のタイミング（ms）
   const STAGED_DETECT_DELAYS = [0, 300, 800, 1500];
+  const MIN_TABLE_SCORE = 5;
 
   // ============================================================
   // サイト設定
   // ============================================================
   const CONFIG = {
-    // ページモード判定
     pageModes: {
       list: [/\/staff\/index/, /\/staff\/.*list/, /\/staff\/.*inbox/],
       personal: [/\/staff\/personalbox/, /\/staff\/personal/, /\/staff\/.*detail/],
     },
-
-    // 返信欄セレクタ（優先順位順）
     textareaSelectors: [
       'textarea[name="message1"]',
       'textarea.msg.wd100',
@@ -77,19 +65,11 @@
       'textarea[name="mail_body"]',
       'textarea[name="content"]',
     ],
-
-    // 除外キーワード
     excludeKeywords: ['memo', 'admin', 'note', 'futari', 'two_memo', 'staff'],
     excludeClassKeywords: ['admin', 'memo', 'note'],
-
-    // 行検出セレクタ
     rowSelectors: ['tr.rowitem', 'tr[id^="row"]', 'tr[class*="row"]', 'tbody > tr', 'tr'],
-
-    // 表示件数テキスト
-    countTextSelectors: ['.count', '.result', '.paging', '.list_head', '[class*="count"]', '[class*="paging"]'],
-    countPatterns: [/(\d+)\s*件/, /表示\s*[:\s]*(\d+)/, /全\s*(\d+)/],
-
-    // トリガセレクタ
+    countPatterns: [/表示\s*(\d+)\s*件/, /(\d+)\s*件/, /全\s*(\d+)/],
+    listHeaderKeywords: ['キャラ情報', '会話', '状況', 'ふたりメモ', 'ユーザー情報', '更新', '名前', '返信', 'ステータス', 'チェック'],
     clickTriggerSelectors: [
       'input[type="submit"][value*="更新"]', 'input[value="更新"]', '.reload-btn',
       'input[type="submit"][value*="切替"]', 'input[type="submit"][value*="表示"]',
@@ -97,18 +77,7 @@
       'input[value*="一括"]', 'input[value*="チェック"]',
     ],
     changeTriggerSelectors: ['select[name*="box"]', 'select[name*="folder"]', 'select[name*="type"]'],
-
-    // 一覧領域候補（MutationObserver用）
-    listAreaSelectors: [
-      'table.list', 'table[class*="list"]', '#list_area', '.list_area',
-      'form table', '#main_content table', '.content table',
-    ],
-
-    ui: {
-      title: 'MEM 返信アシスト',
-      primaryColor: '#48bb78',
-      accentColor: '#276749',
-    },
+    ui: { title: 'MEM 返信アシスト', primaryColor: '#48bb78', accentColor: '#276749' },
   };
 
   // ============================================================
@@ -124,32 +93,18 @@
     stagedDetectIndex: 0,
     stagedDetectTimer: null,
     lastUrl: '',
-
-    // ページモード
-    pageMode: 'other', // list, personal, other
-
-    // 返信欄
+    pageMode: 'other',
     textarea: { status: 'pending', element: null, selector: null, where: null, iframeSrc: null },
-
-    // 行検出
-    rows: { count: 0, displayCountNum: null, scopeHint: null, usedSelector: null, mismatchWarning: null },
-
-    // 検出メタ
+    rows: { count: 0, displayCountNum: null, scopeHint: null, usedSelector: null, mismatchWarning: null, tableScore: null },
     lastDetectTime: null,
     lastTrigger: null,
-
-    // Sheet
     messages: [],
     sheetUrl: '',
-    sheetStatus: 'idle', // idle, loading, success, error
+    sheetStatus: 'idle',
     sheetError: null,
-
-    // パネル
     panelPos: { x: 20, y: 20 },
     dragging: false,
     dragOffset: { x: 0, y: 0 },
-
-    // 監視
     observeTargetHint: null,
   };
 
@@ -184,12 +139,8 @@
   // ============================================================
   function detectPageMode() {
     const path = location.pathname;
-    for (const pattern of CONFIG.pageModes.list) {
-      if (pattern.test(path)) return 'list';
-    }
-    for (const pattern of CONFIG.pageModes.personal) {
-      if (pattern.test(path)) return 'personal';
-    }
+    for (const pattern of CONFIG.pageModes.list) { if (pattern.test(path)) return 'list'; }
+    for (const pattern of CONFIG.pageModes.personal) { if (pattern.test(path)) return 'personal'; }
     return 'other';
   }
 
@@ -201,12 +152,8 @@
     const name = (el.name || '').toLowerCase();
     const id = (el.id || '').toLowerCase();
     const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
-    for (const kw of CONFIG.excludeKeywords) {
-      if (name.includes(kw) || id.includes(kw)) return true;
-    }
-    for (const kw of CONFIG.excludeClassKeywords) {
-      if (cls.includes(kw)) return true;
-    }
+    for (const kw of CONFIG.excludeKeywords) { if (name.includes(kw) || id.includes(kw)) return true; }
+    for (const kw of CONFIG.excludeClassKeywords) { if (cls.includes(kw)) return true; }
     const dt = el.getAttribute('data-type');
     if (dt && (dt.includes('admin') || dt.includes('memo'))) return true;
     return false;
@@ -221,53 +168,82 @@
   }
 
   // ============================================================
-  // scope特定（行検出用）
+  // テーブルスコアリング (v2.3.1 新規追加)
+  // ============================================================
+  
+  function getAllTables(doc) {
+    return $$('table', doc || document);
+  }
+
+  function scoreListTable(table) {
+    if (!table) return 0;
+    let score = 0;
+    const tbody = $('tbody', table) || table;
+    const rows = $$('tr', tbody).filter(tr => !$('th', tr));
+    const rowCount = rows.length;
+    score += Math.min(rowCount * 1.5, 30);
+    if (rowCount < 3) score -= 20;
+    const checkboxes = $$('input[type="checkbox"]', table);
+    if (checkboxes.length >= 1) score += 10;
+    if (checkboxes.length >= 5) score += 5;
+    if ($('td.chatview', table)) score += 15;
+    if ($('tr.rowitem', table)) score += 10;
+    const headerText = ($$('th', table).map(th => th.textContent || '').join(' ') +
+                        $$('thead td', table).map(td => td.textContent || '').join(' ')).toLowerCase();
+    for (const kw of CONFIG.listHeaderKeywords) {
+      if (headerText.includes(kw.toLowerCase())) { score += 5; break; }
+    }
+    if (table.parentElement?.tagName === 'FORM') score -= 10;
+    try { const rect = table.getBoundingClientRect(); if (rect.width < 300) score -= 15; } catch {}
+    return score;
+  }
+
+  function findBestListTable() {
+    const tables = getAllTables();
+    let best = null;
+    let bestScore = -Infinity;
+    for (const table of tables) {
+      const score = scoreListTable(table);
+      if (score > bestScore) { bestScore = score; best = table; }
+    }
+    if (best && bestScore >= MIN_TABLE_SCORE) {
+      const tbody = $('tbody', best) || best;
+      return { table: best, tbody, score: bestScore, hint: `bestTable(score=${bestScore})` };
+    }
+    return null;
+  }
+
+  // ============================================================
+  // scope特定（行検出用）- 改良版
   // ============================================================
   function findRowScope() {
-    // (1) td.chatview
+    const best = findBestListTable();
+    if (best) {
+      logger.info(`[Scope] bestTable採用 score=${best.score}`);
+      return { el: best.tbody, hint: best.hint, tableScore: best.score };
+    }
     const cv = $('td.chatview');
-    if (cv) {
-      const t = cv.closest('table');
-      if (t) return { el: $('tbody', t) || t, hint: 'td.chatview → table' };
-    }
-    // (2) tr.rowitem
+    if (cv) { const t = cv.closest('table'); if (t) return { el: $('tbody', t) || t, hint: 'td.chatview → table', tableScore: null }; }
     const ri = $('tr.rowitem');
-    if (ri) {
-      const t = ri.closest('table');
-      if (t) return { el: $('tbody', t) || t, hint: 'tr.rowitem → table' };
-    }
-    // (3) checkbox複数
+    if (ri) { const t = ri.closest('table'); if (t) return { el: $('tbody', t) || t, hint: 'tr.rowitem → table', tableScore: null }; }
     const cbs = $$('table input[type="checkbox"]');
-    if (cbs.length >= 2) {
-      const t = cbs[0].closest('table');
-      if (t) return { el: $('tbody', t) || t, hint: `checkbox(${cbs.length}) → table` };
-    }
-    // (4) listAreaから探す
-    for (const sel of CONFIG.listAreaSelectors) {
-      const el = $(sel);
-      if (el) return { el, hint: `listArea: ${sel}` };
-    }
-    return { el: document.body, hint: 'fallback: body' };
+    if (cbs.length >= 2) { const t = cbs[0].closest('table'); if (t) return { el: $('tbody', t) || t, hint: `checkbox(${cbs.length}) → table`, tableScore: null }; }
+    logger.warn('[Scope] fallback to body');
+    return { el: document.body, hint: 'fallback: body', tableScore: null };
   }
 
   function countRowsInScope(scopeEl) {
     for (const sel of CONFIG.rowSelectors) {
-      try {
-        const rows = $$(sel, scopeEl).filter(tr => !$('th', tr));
-        if (rows.length > 0) return { count: rows.length, selector: sel };
-      } catch {}
+      try { const rows = $$(sel, scopeEl).filter(tr => !$('th', tr)); if (rows.length > 0) return { count: rows.length, selector: sel }; } catch {}
     }
     return { count: 0, selector: null };
   }
 
   function extractDisplayCount() {
-    for (const sel of CONFIG.countTextSelectors) {
-      for (const el of $$(sel)) {
-        for (const pat of CONFIG.countPatterns) {
-          const m = (el.textContent || '').match(pat);
-          if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n >= 0) return n; }
-        }
-      }
+    const bodyText = document.body ? document.body.innerText : '';
+    for (const pat of CONFIG.countPatterns) {
+      const m = bodyText.match(pat);
+      if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n >= 0 && n < 10000) return n; }
     }
     return null;
   }
@@ -277,7 +253,7 @@
   // ============================================================
   function detectRows() {
     if (state.pageMode !== 'list') {
-      state.rows = { count: state.pageMode === 'personal' ? 1 : 0, displayCountNum: null, scopeHint: 'N/A (not list mode)', usedSelector: null, mismatchWarning: null };
+      state.rows = { count: state.pageMode === 'personal' ? 1 : 0, displayCountNum: null, scopeHint: 'N/A (not list mode)', usedSelector: null, mismatchWarning: null, tableScore: null };
       return;
     }
     const scope = findRowScope();
@@ -286,7 +262,7 @@
     let warn = null;
     if (dispNum !== null && res.count === 0 && dispNum > 0) warn = '行セレクタ不一致';
     else if (dispNum !== null && dispNum > 0 && Math.abs(res.count - dispNum) >= 5) warn = 'scope誤認の可能性';
-    state.rows = { count: res.count, displayCountNum: dispNum, scopeHint: scope.hint, usedSelector: res.selector, mismatchWarning: warn };
+    state.rows = { count: res.count, displayCountNum: dispNum, scopeHint: scope.hint, usedSelector: res.selector, mismatchWarning: warn, tableScore: scope.tableScore };
   }
 
   // ============================================================
@@ -294,11 +270,7 @@
   // ============================================================
   function findReplyTextarea() {
     for (const sel of CONFIG.textareaSelectors) {
-      for (const el of $$(sel)) {
-        if (!isExcludedTextarea(el) && isElementVisible(el)) {
-          return { element: el, selector: sel, where: 'main', iframeSrc: null };
-        }
-      }
+      for (const el of $$(sel)) { if (!isExcludedTextarea(el) && isElementVisible(el)) return { element: el, selector: sel, where: 'main', iframeSrc: null }; }
     }
     for (const iframe of $$('iframe')) {
       try {
@@ -306,16 +278,8 @@
         if (!doc) continue;
         const win = iframe.contentWindow;
         const src = iframe.src || iframe.name || 'iframe';
-        for (const sel of CONFIG.textareaSelectors) {
-          for (const el of $$(sel, doc)) {
-            if (!isExcludedTextarea(el) && isElementVisible(el, win)) {
-              return { element: el, selector: sel, where: 'iframe', iframeSrc: src };
-            }
-          }
-        }
-        if (doc.body?.contentEditable === 'true') {
-          return { element: doc.body, selector: 'body[contenteditable]', where: 'iframe', iframeSrc: src };
-        }
+        for (const sel of CONFIG.textareaSelectors) { for (const el of $$(sel, doc)) { if (!isExcludedTextarea(el) && isElementVisible(el, win)) return { element: el, selector: sel, where: 'iframe', iframeSrc: src }; } }
+        if (doc.body?.contentEditable === 'true') return { element: doc.body, selector: 'body[contenteditable]', where: 'iframe', iframeSrc: src };
       } catch {}
     }
     return null;
@@ -323,10 +287,7 @@
 
   function detectTextarea() {
     const res = findReplyTextarea();
-    if (res) {
-      state.textarea = { status: 'found', element: res.element, selector: res.selector, where: res.where, iframeSrc: res.iframeSrc };
-      return true;
-    }
+    if (res) { state.textarea = { status: 'found', element: res.element, selector: res.selector, where: res.where, iframeSrc: res.iframeSrc }; return true; }
     state.textarea = { status: 'not_found', element: null, selector: null, where: null, iframeSrc: null };
     return false;
   }
@@ -341,7 +302,7 @@
     detectTextarea();
     state.lastDetectTime = Date.now();
     state.lastTrigger = trigger || 'manual';
-    logger.info(`検出 [${trigger}] mode=${state.pageMode} rows=${state.rows.count} ta=${state.textarea.status}`);
+    logger.info(`検出 [${trigger}] mode=${state.pageMode} rows=${state.rows.count} ta=${state.textarea.status} scope=${state.rows.scopeHint}`);
     updateUI();
   }
 
@@ -349,17 +310,13 @@
     if (state.stopped) return;
     clearTimeout(state.stagedDetectTimer);
     state.stagedDetectIndex = 0;
-
     function next() {
       if (state.stopped || state.stagedDetectIndex >= STAGED_DETECT_DELAYS.length) return;
       const delay = STAGED_DETECT_DELAYS[state.stagedDetectIndex];
       state.stagedDetectTimer = setTimeout(() => {
         runDetection(`init-stage${state.stagedDetectIndex}`);
         state.stagedDetectIndex++;
-        // 行が見つかったら終了、見つからなければ次へ
-        if (state.pageMode === 'list' && state.rows.count === 0 && state.stagedDetectIndex < STAGED_DETECT_DELAYS.length) {
-          next();
-        }
+        if (state.pageMode === 'list' && state.rows.count === 0 && state.stagedDetectIndex < STAGED_DETECT_DELAYS.length) next();
       }, delay);
     }
     next();
@@ -375,126 +332,51 @@
     const cur = (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') ? el.value : (el.textContent || el.innerHTML || '');
     if (cur && cur.length > 0) { showNotify('既にテキストが入力されています', 'warn'); return false; }
     try {
-      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-        el.value = text;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      } else {
-        el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      el.focus();
-      showNotify('挿入しました', 'success');
-      return true;
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') { el.value = text; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+      else { el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>'); el.dispatchEvent(new Event('input', { bubbles: true })); }
+      el.focus(); showNotify('挿入しました', 'success'); return true;
     } catch (e) { showNotify('挿入失敗', 'error'); return false; }
   }
 
   // ============================================================
-  // Google Sheet（GM_xmlhttpRequest でCORS回避）
+  // Google Sheet
   // ============================================================
   function normalizeSheetUrl(url) {
     if (!url) return null;
     const u = url.trim();
     if (u.includes('/export?format=csv') || u.includes('output=csv') || u.includes('/gviz/tq')) return u;
     const m = u.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
-    if (m) {
-      const gidM = u.match(/gid=(\d+)/);
-      return `https://docs.google.com/spreadsheets/d/${m[1]}/export?format=csv&gid=${gidM ? gidM[1] : '0'}`;
-    }
+    if (m) { const gidM = u.match(/gid=(\d+)/); return `https://docs.google.com/spreadsheets/d/${m[1]}/export?format=csv&gid=${gidM ? gidM[1] : '0'}`; }
     return u;
   }
 
   function parseCsv(csv) {
-    return csv.split('\n').map(line => {
-      const t = line.trim();
-      if (!t) return null;
-      if (t.startsWith('"')) {
-        const end = t.indexOf('",');
-        if (end > 0) return t.substring(1, end).replace(/""/g, '"');
-        if (t.endsWith('"')) return t.slice(1, -1).replace(/""/g, '"');
-      }
-      const c = t.indexOf(',');
-      return c > 0 ? t.substring(0, c) : t;
-    }).filter(Boolean).map(s => s.trim()).filter(Boolean);
+    return csv.split('\n').map(line => { const t = line.trim(); if (!t) return null; if (t.startsWith('"')) { const end = t.indexOf('",'); if (end > 0) return t.substring(1, end).replace(/""/g, '"'); if (t.endsWith('"')) return t.slice(1, -1).replace(/""/g, '"'); } const c = t.indexOf(','); return c > 0 ? t.substring(0, c) : t; }).filter(Boolean).map(s => s.trim()).filter(Boolean);
   }
 
   function fetchSheet(url) {
-    state.sheetStatus = 'loading';
-    state.sheetError = null;
-    updateUI();
-
+    state.sheetStatus = 'loading'; state.sheetError = null; updateUI();
     const normalized = normalizeSheetUrl(url);
-    if (!normalized) {
-      state.sheetStatus = 'error';
-      state.sheetError = 'URLが無効です';
-      updateUI();
-      return;
-    }
-
+    if (!normalized) { state.sheetStatus = 'error'; state.sheetError = 'URLが無効です'; updateUI(); return; }
     logger.info('Sheet読み込み開始', normalized);
-
-    // GM_xmlhttpRequest があれば使う（CORS回避）
     if (typeof GM_xmlhttpRequest !== 'undefined') {
       GM_xmlhttpRequest({
-        method: 'GET',
-        url: normalized,
-        timeout: 15000,
+        method: 'GET', url: normalized, timeout: 15000,
         onload: function(res) {
-          if (res.status >= 200 && res.status < 300) {
-            const msgs = parseCsv(res.responseText);
-            if (msgs.length === 0) {
-              state.sheetStatus = 'error';
-              state.sheetError = 'データがありません';
-            } else {
-              state.messages = msgs;
-              state.sheetUrl = url;
-              state.sheetStatus = 'success';
-              storageSet('sheetUrl', url);
-              storageSet('messages', msgs);
-              showNotify(`${msgs.length}件読み込み`, 'success');
-              logger.info(`Sheet読み込み成功: ${msgs.length}件`);
-            }
-          } else if (res.status === 403) {
-            state.sheetStatus = 'error';
-            state.sheetError = '権限エラー(403): シートを「リンクを知っている全員」に公開してください';
-          } else if (res.status === 404) {
-            state.sheetStatus = 'error';
-            state.sheetError = 'シート未発見(404): URLを確認してください';
-          } else {
-            state.sheetStatus = 'error';
-            state.sheetError = `HTTPエラー: ${res.status}`;
-          }
+          if (res.status >= 200 && res.status < 300) { const msgs = parseCsv(res.responseText); if (msgs.length === 0) { state.sheetStatus = 'error'; state.sheetError = 'データがありません'; } else { state.messages = msgs; state.sheetUrl = url; state.sheetStatus = 'success'; storageSet('sheetUrl', url); storageSet('messages', msgs); showNotify(`${msgs.length}件読み込み`, 'success'); logger.info(`Sheet読み込み成功: ${msgs.length}件`); } }
+          else if (res.status === 403) { state.sheetStatus = 'error'; state.sheetError = '権限エラー(403): シートを公開してください'; }
+          else if (res.status === 404) { state.sheetStatus = 'error'; state.sheetError = 'シート未発見(404)'; }
+          else { state.sheetStatus = 'error'; state.sheetError = `HTTPエラー: ${res.status}`; }
           updateUI();
         },
-        onerror: function() {
-          state.sheetStatus = 'error';
-          state.sheetError = 'ネットワークエラー';
-          updateUI();
-        },
-        ontimeout: function() {
-          state.sheetStatus = 'error';
-          state.sheetError = 'タイムアウト';
-          updateUI();
-        },
+        onerror: function() { state.sheetStatus = 'error'; state.sheetError = 'ネットワークエラー'; updateUI(); },
+        ontimeout: function() { state.sheetStatus = 'error'; state.sheetError = 'タイムアウト'; updateUI(); },
       });
     } else {
-      // fallback: fetch（CORSで失敗する可能性あり）
       fetch(normalized, { method: 'GET', mode: 'cors', credentials: 'omit' })
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
-        .then(csv => {
-          const msgs = parseCsv(csv);
-          if (msgs.length === 0) throw new Error('データがありません');
-          state.messages = msgs;
-          state.sheetUrl = url;
-          state.sheetStatus = 'success';
-          storageSet('sheetUrl', url);
-          storageSet('messages', msgs);
-          showNotify(`${msgs.length}件読み込み`, 'success');
-        })
-        .catch(e => {
-          state.sheetStatus = 'error';
-          state.sheetError = e.message.includes('Failed to fetch') ? 'CORSエラー: 直接入力を使用してください' : e.message;
-        })
+        .then(csv => { const msgs = parseCsv(csv); if (msgs.length === 0) throw new Error('データがありません'); state.messages = msgs; state.sheetUrl = url; state.sheetStatus = 'success'; storageSet('sheetUrl', url); storageSet('messages', msgs); showNotify(`${msgs.length}件読み込み`, 'success'); })
+        .catch(e => { state.sheetStatus = 'error'; state.sheetError = e.message.includes('Failed to fetch') ? 'CORSエラー' : e.message; })
         .finally(() => updateUI());
     }
   }
@@ -503,18 +385,10 @@
   // 通知
   // ============================================================
   function showNotify(msg, type) {
-    const old = $('#dating-ops-notify');
-    if (old) old.remove();
+    const old = $('#dating-ops-notify'); if (old) old.remove();
     const colors = { info: '#48bb78', success: '#48bb78', warn: '#f6ad55', error: '#fc8181' };
-    const el = document.createElement('div');
-    el.id = 'dating-ops-notify';
-    el.textContent = msg;
-    Object.assign(el.style, {
-      position: 'fixed', bottom: '20px', right: '20px', padding: '10px 16px',
-      background: colors[type] || colors.info, color: '#fff', borderRadius: '6px',
-      boxShadow: '0 4px 12px rgba(0,0,0,0.3)', zIndex: '2147483647',
-      fontSize: '13px', fontFamily: 'system-ui, sans-serif', maxWidth: '300px',
-    });
+    const el = document.createElement('div'); el.id = 'dating-ops-notify'; el.textContent = msg;
+    Object.assign(el.style, { position: 'fixed', bottom: '20px', right: '20px', padding: '10px 16px', background: colors[type] || colors.info, color: '#fff', borderRadius: '6px', boxShadow: '0 4px 12px rgba(0,0,0,0.3)', zIndex: '2147483647', fontSize: '13px', fontFamily: 'system-ui, sans-serif', maxWidth: '300px' });
     document.body.appendChild(el);
     setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.3s'; setTimeout(() => el.remove(), 300); }, 3500);
   }
@@ -566,61 +440,34 @@
       #${PANEL_ID} .detail-box{background:#45475a;border-radius:4px;padding:6px;font-size:10px;color:#a6adc8;margin-top:4px}
       #${PANEL_ID} .detail-box .label{color:#6c7086}
     `;
-    const s = document.createElement('style');
-    s.id = 'dating-ops-styles';
-    s.textContent = css;
-    document.head.appendChild(s);
+    const s = document.createElement('style'); s.id = 'dating-ops-styles'; s.textContent = css; document.head.appendChild(s);
   }
 
   function buildPanelHtml() {
-    const pm = state.pageMode;
-    const r = state.rows;
-    const t = state.textarea;
-
-    // mode表示
+    const pm = state.pageMode, r = state.rows, t = state.textarea;
     const modeText = pm === 'list' ? '一括送信' : pm === 'personal' ? '個別送信' : 'その他';
     const modeClass = pm === 'list' ? 'st-info' : pm === 'personal' ? 'st-ok' : 'st-warn';
-
-    // 行数表示
     let rowText, rowClass;
-    if (pm === 'personal') {
-      rowText = '1 (個別送信ページ)';
-      rowClass = 'st-ok';
-    } else if (pm === 'list') {
-      rowText = r.count > 0 ? `${r.count}行` : '0行';
-      rowClass = r.count > 0 ? 'st-ok' : 'st-warn';
-    } else {
-      rowText = '-';
-      rowClass = 'st-info';
-    }
-
-    // 返信欄
+    if (pm === 'personal') { rowText = '1 (個別送信ページ)'; rowClass = 'st-ok'; }
+    else if (pm === 'list') { rowText = r.count > 0 ? `${r.count}行` : '0行'; rowClass = r.count > 0 ? 'st-ok' : 'st-warn'; }
+    else { rowText = '-'; rowClass = 'st-info'; }
     let taText, taClass;
-    if (t.status === 'found') {
-      taText = `${t.selector} (${t.where})`;
-      taClass = 'st-ok';
-    } else {
-      taText = '未検出';
-      taClass = 'st-warn';
-    }
-
-    // Sheet
+    if (t.status === 'found') { taText = `${t.selector} (${t.where})`; taClass = 'st-ok'; } else { taText = '未検出'; taClass = 'st-warn'; }
     const sheetMap = { idle: { t: '未設定', c: 'st-warn' }, loading: { t: '読込中...', c: 'st-info' }, success: { t: `${state.messages.length}件`, c: 'st-ok' }, error: { t: 'エラー', c: 'st-err' } };
     const sh = sheetMap[state.sheetStatus] || sheetMap.idle;
 
-    // 詳細
     let detail = `<div><span class="label">最終検出:</span> ${formatTime(state.lastDetectTime)}</div>`;
     detail += `<div><span class="label">トリガ:</span> ${state.lastTrigger || '-'}</div>`;
     detail += `<div><span class="label">scope:</span> ${escapeHtml(r.scopeHint || '-')}</div>`;
+    if (r.tableScore !== null) detail += `<div><span class="label">tableScore:</span> ${r.tableScore}</div>`;
+    detail += `<div><span class="label">displayCount:</span> ${r.displayCountNum !== null ? r.displayCountNum : '-'}</div>`;
     detail += `<div><span class="label">行セレクタ:</span> ${escapeHtml(r.usedSelector || '-')}</div>`;
     if (t.iframeSrc) detail += `<div><span class="label">iframe:</span> ${escapeHtml(t.iframeSrc)}</div>`;
     if (state.observeTargetHint) detail += `<div><span class="label">監視:</span> ${escapeHtml(state.observeTargetHint)}</div>`;
 
-    // 警告
     let warn = '';
     if (r.mismatchWarning) warn = `<div class="warn-box">⚠️ ${escapeHtml(r.mismatchWarning)}</div>`;
 
-    // メッセージ
     const msgHtml = state.messages.length > 0
       ? state.messages.map((m, i) => `<div class="msg-item" data-idx="${i}" title="${escapeHtml(m)}">${escapeHtml(m.length > 40 ? m.substring(0, 40) + '...' : m)}</div>`).join('')
       : '<div class="msg-item" style="color:#6c7086;">メッセージなし</div>';
@@ -661,81 +508,35 @@
   }
 
   function createPanel() {
-    const old = $(`#${PANEL_ID}`);
-    if (old) old.remove();
+    const old = $(`#${PANEL_ID}`); if (old) old.remove();
     createStyles();
-    const panel = document.createElement('div');
-    panel.id = PANEL_ID;
-    panel.innerHTML = buildPanelHtml();
-    const pos = storageGet('panelPos', null);
-    if (pos) state.panelPos = pos;
-    panel.style.left = `${state.panelPos.x}px`;
-    panel.style.top = `${state.panelPos.y}px`;
-    document.body.appendChild(panel);
-    state.panel = panel;
-    bindPanelEvents();
+    const panel = document.createElement('div'); panel.id = PANEL_ID; panel.innerHTML = buildPanelHtml();
+    const pos = storageGet('panelPos', null); if (pos) state.panelPos = pos;
+    panel.style.left = `${state.panelPos.x}px`; panel.style.top = `${state.panelPos.y}px`;
+    document.body.appendChild(panel); state.panel = panel; bindPanelEvents();
   }
 
   function bindPanelEvents() {
-    const p = state.panel;
-    if (!p) return;
+    const p = state.panel; if (!p) return;
     p.querySelector('.header')?.addEventListener('mousedown', onDragStart);
     p.querySelector('#dp-close')?.addEventListener('click', () => p.style.display = 'none');
-    p.querySelector('#dp-load-sheet')?.addEventListener('click', () => {
-      const url = p.querySelector('#dp-sheet-url')?.value?.trim();
-      url ? fetchSheet(url) : showNotify('URLを入力', 'warn');
-    });
+    p.querySelector('#dp-load-sheet')?.addEventListener('click', () => { const url = p.querySelector('#dp-sheet-url')?.value?.trim(); url ? fetchSheet(url) : showNotify('URLを入力', 'warn'); });
     p.querySelector('#dp-rescan')?.addEventListener('click', () => { showNotify('再検出', 'info'); runDetection('manual'); });
-    p.querySelector('#dp-apply-direct')?.addEventListener('click', () => {
-      const txt = p.querySelector('#dp-direct')?.value?.trim();
-      if (!txt) { showNotify('テキストを入力', 'warn'); return; }
-      const msgs = txt.split('\n').map(l => l.trim()).filter(Boolean);
-      if (msgs.length === 0) { showNotify('有効なメッセージなし', 'warn'); return; }
-      state.messages = msgs;
-      storageSet('messages', msgs);
-      state.sheetStatus = 'success';
-      showNotify(`${msgs.length}件適用`, 'success');
-      updateUI();
-    });
-    p.querySelector('#dp-stop')?.addEventListener('click', () => {
-      state.stopped = true;
-      state.observer?.disconnect();
-      clearInterval(state.healthTimer);
-      clearInterval(state.urlPollTimer);
-      clearTimeout(state.stagedDetectTimer);
-      showNotify('停止しました', 'warn');
-      updateUI();
-    });
+    p.querySelector('#dp-apply-direct')?.addEventListener('click', () => { const txt = p.querySelector('#dp-direct')?.value?.trim(); if (!txt) { showNotify('テキストを入力', 'warn'); return; } const msgs = txt.split('\n').map(l => l.trim()).filter(Boolean); if (msgs.length === 0) { showNotify('有効なメッセージなし', 'warn'); return; } state.messages = msgs; storageSet('messages', msgs); state.sheetStatus = 'success'; showNotify(`${msgs.length}件適用`, 'success'); updateUI(); });
+    p.querySelector('#dp-stop')?.addEventListener('click', () => { state.stopped = true; state.observer?.disconnect(); clearInterval(state.healthTimer); clearInterval(state.urlPollTimer); clearTimeout(state.stagedDetectTimer); showNotify('停止しました', 'warn'); updateUI(); });
     p.querySelector('#dp-diag')?.addEventListener('click', runDiagnostic);
-    p.querySelector('#dp-msg-list')?.addEventListener('click', e => {
-      const item = e.target.closest('.msg-item');
-      if (item) { const i = parseInt(item.dataset.idx, 10); if (!isNaN(i) && state.messages[i]) insertText(state.messages[i]); }
-    });
+    p.querySelector('#dp-msg-list')?.addEventListener('click', e => { const item = e.target.closest('.msg-item'); if (item) { const i = parseInt(item.dataset.idx, 10); if (!isNaN(i) && state.messages[i]) insertText(state.messages[i]); } });
     document.addEventListener('mousemove', onDragMove);
     document.addEventListener('mouseup', onDragEnd);
   }
 
-  function onDragStart(e) {
-    if (e.target.closest('.header-close')) return;
-    state.dragging = true;
-    state.dragOffset = { x: e.clientX - state.panelPos.x, y: e.clientY - state.panelPos.y };
-    if (state.panel) state.panel.style.transition = 'none';
-  }
-  function onDragMove(e) {
-    if (!state.dragging || !state.panel) return;
-    state.panelPos = { x: Math.max(0, Math.min(window.innerWidth - 350, e.clientX - state.dragOffset.x)), y: Math.max(0, Math.min(window.innerHeight - 50, e.clientY - state.dragOffset.y)) };
-    state.panel.style.left = `${state.panelPos.x}px`;
-    state.panel.style.top = `${state.panelPos.y}px`;
-  }
-  function onDragEnd() {
-    if (!state.dragging) return;
-    state.dragging = false;
-    storageSet('panelPos', state.panelPos);
-    if (state.panel) state.panel.style.transition = '';
-  }
+  function onDragStart(e) { if (e.target.closest('.header-close')) return; state.dragging = true; state.dragOffset = { x: e.clientX - state.panelPos.x, y: e.clientY - state.panelPos.y }; if (state.panel) state.panel.style.transition = 'none'; }
+  function onDragMove(e) { if (!state.dragging || !state.panel) return; state.panelPos = { x: Math.max(0, Math.min(window.innerWidth - 350, e.clientX - state.dragOffset.x)), y: Math.max(0, Math.min(window.innerHeight - 50, e.clientY - state.dragOffset.y)) }; state.panel.style.left = `${state.panelPos.x}px`; state.panel.style.top = `${state.panelPos.y}px`; }
+  function onDragEnd() { if (!state.dragging) return; state.dragging = false; storageSet('panelPos', state.panelPos); if (state.panel) state.panel.style.transition = ''; }
   function updateUI() { if (state.panel) { state.panel.innerHTML = buildPanelHtml(); bindPanelEvents(); } }
+
   function runDiagnostic() {
-    const d = { siteType: SITE_TYPE, version: '2.3.0', pageMode: state.pageMode, textarea: state.textarea, rows: state.rows, lastDetectTime: state.lastDetectTime, lastTrigger: state.lastTrigger, messages: state.messages.length, sheetStatus: state.sheetStatus, sheetError: state.sheetError, url: location.href };
+    const d = { siteType: SITE_TYPE, version: '2.3.1', pageMode: state.pageMode, textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where }, rows: state.rows, lastDetectTime: state.lastDetectTime, lastTrigger: state.lastTrigger, observeTargetHint: state.observeTargetHint, messagesCount: state.messages.length, sheetStatus: state.sheetStatus, sheetError: state.sheetError, url: location.href };
     console.group('%c[DatingOps] 診断', 'color:#48bb78;font-weight:bold'); console.log(d); console.groupEnd();
     navigator.clipboard?.writeText(JSON.stringify(d, null, 2)).then(() => showNotify('診断情報コピー', 'info')).catch(() => {});
     return d;
@@ -746,27 +547,19 @@
   // ============================================================
   function bindTriggerEvents() {
     const debouncedDetect = debounce(trigger => runDetection(trigger), OBSERVER_DEBOUNCE_MS);
-    document.addEventListener('click', e => {
-      if (state.stopped || !e.target || e.target.closest(`#${PANEL_ID}`)) return;
-      for (const sel of CONFIG.clickTriggerSelectors) {
-        try { if (e.target.matches(sel) || e.target.closest(sel)) { debouncedDetect('click'); return; } } catch {}
-      }
-    }, true);
-    document.addEventListener('change', e => {
-      if (state.stopped || !e.target || e.target.tagName !== 'SELECT' || e.target.closest(`#${PANEL_ID}`)) return;
-      for (const sel of CONFIG.changeTriggerSelectors) {
-        try { if (e.target.matches(sel)) { debouncedDetect('change'); return; } } catch {}
-      }
-    }, true);
+    document.addEventListener('click', e => { if (state.stopped || !e.target || e.target.closest(`#${PANEL_ID}`)) return; for (const sel of CONFIG.clickTriggerSelectors) { try { if (e.target.matches(sel) || e.target.closest(sel)) { debouncedDetect('click'); return; } } catch {} } }, true);
+    document.addEventListener('change', e => { if (state.stopped || !e.target || e.target.tagName !== 'SELECT' || e.target.closest(`#${PANEL_ID}`)) return; for (const sel of CONFIG.changeTriggerSelectors) { try { if (e.target.matches(sel)) { debouncedDetect('change'); return; } } catch {} } }, true);
   }
 
   // ============================================================
-  // MutationObserver
+  // MutationObserver - 改良版
   // ============================================================
   function findObserveTarget() {
-    for (const sel of CONFIG.listAreaSelectors) { const el = $(sel); if (el) return { target: el, hint: sel }; }
-    const scope = findRowScope();
-    if (scope.el !== document.body) return { target: scope.el, hint: `scope: ${scope.hint}` };
+    const best = findBestListTable();
+    if (best) return { target: best.tbody, hint: `bestTable(score=${best.score})` };
+    const cv = $('td.chatview'); if (cv) { const t = cv.closest('table'); if (t) return { target: $('tbody', t) || t, hint: 'td.chatview → table' }; }
+    const ri = $('tr.rowitem'); if (ri) { const t = ri.closest('table'); if (t) return { target: $('tbody', t) || t, hint: 'tr.rowitem → table' }; }
+    logger.warn('一覧テーブル特定できず、bodyを監視');
     return { target: document.body, hint: 'body (fallback)' };
   }
 
@@ -777,10 +570,7 @@
     if (info.target === document.body) logger.warn('一覧領域特定できず、bodyを監視');
     else logger.info(`監視対象: ${info.hint}`);
     const handler = debounce(() => { if (!state.stopped) runDetection('mutation'); }, OBSERVER_DEBOUNCE_MS);
-    state.observer = new MutationObserver(muts => {
-      if (muts.some(m => m.target.id === PANEL_ID || m.target.closest?.(`#${PANEL_ID}`))) return;
-      handler();
-    });
+    state.observer = new MutationObserver(muts => { if (muts.some(m => m.target.id === PANEL_ID || m.target.closest?.(`#${PANEL_ID}`))) return; handler(); });
     state.observer.observe(info.target, { childList: true, subtree: true });
   }
 
@@ -789,22 +579,14 @@
   // ============================================================
   function setupUrlChangeDetection() {
     state.lastUrl = location.href;
-    // history hook
     const wrap = fn => function() { const r = fn.apply(this, arguments); onUrlChange('history'); return r; };
     history.pushState = wrap(history.pushState);
     history.replaceState = wrap(history.replaceState);
     window.addEventListener('popstate', () => onUrlChange('popstate'));
-    // polling
     state.urlPollTimer = setInterval(() => { if (location.href !== state.lastUrl) onUrlChange('poll'); }, URL_POLL_MS);
   }
 
-  function onUrlChange(src) {
-    if (state.stopped) return;
-    state.lastUrl = location.href;
-    logger.info(`URL変化検知 (${src})`);
-    startObserver();
-    runStagedDetection();
-  }
+  function onUrlChange(src) { if (state.stopped) return; state.lastUrl = location.href; logger.info(`URL変化検知 (${src})`); startObserver(); runStagedDetection(); }
 
   // ============================================================
   // ヘルスチェック
@@ -813,13 +595,8 @@
     state.healthTimer = setInterval(() => {
       if (state.stopped) { clearInterval(state.healthTimer); return; }
       if (!$(`#${PANEL_ID}`)) createPanel();
-      const pm = state.pageMode;
-      const taOk = state.textarea.status === 'found';
-      const rowsOk = pm === 'personal' || state.rows.count > 0;
-      if (!taOk || (pm === 'list' && !rowsOk)) {
-        logger.info('ヘルスチェック: 再検出');
-        runDetection('health');
-      }
+      const pm = state.pageMode, taOk = state.textarea.status === 'found', rowsOk = pm === 'personal' || state.rows.count > 0;
+      if (!taOk || (pm === 'list' && !rowsOk)) { logger.info('ヘルスチェック: 再検出'); runDetection('health'); }
     }, HEALTH_CHECK_MS);
   }
 
@@ -828,7 +605,7 @@
   // ============================================================
   function init() {
     if (state.initialized || !location.pathname.includes('/staff/')) return;
-    logger.info('初期化開始');
+    logger.info('初期化開始 v2.3.1');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';
@@ -840,7 +617,7 @@
     startHealthCheck();
     runStagedDetection();
     state.initialized = true;
-    window.__datingOps = { state, diag: runDiagnostic, rescan: () => runDetection('manual'), insert: insertText, fetchSheet };
+    window.__datingOps = { state, diag: runDiagnostic, rescan: () => runDetection('manual'), insert: insertText, fetchSheet, findBestListTable, scoreListTable };
     logger.info('初期化完了');
   }
 
