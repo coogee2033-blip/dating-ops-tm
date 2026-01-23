@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dating Ops - OLV
 // @namespace    dating-ops-tm
-// @version      2.4.5
+// @version      2.4.6
 // @description  OLV (olv29.com) 返信アシスト - 返信欄ベース行検出 + 一括挿入機能
 // @author       Dating Ops Team
 // @match        https://olv29.com/staff/*
@@ -277,15 +277,34 @@
   /**
    * 単体送信フォーム内のtextareaかどうか判定
    * （mailbox等の送信フォーム内textareaを除外するためのフィルタ）
+   * @param {HTMLTextAreaElement} ta
+   * @param {object} docFlags
    */
-  function isInsideSingleSendForm(ta) {
+  function isInsideSingleSendForm(ta, docFlags) {
     if (!ta) return false;
     const form = ta.closest('form');
     if (!form) return false;
-    // フォーム内に送信ボタンがあり、かつtextareaが1つだけ → 単体送信フォームの可能性
-    const btns = form.querySelectorAll('input[type="submit"], button[type="submit"], input[value*="送信"], button');
+
+    // box_char の行内フォームまで除外してしまうのを防ぐ
+    if (docFlags?.isBoxChar) return false;
+
+    // 単体送信(mailbox)フォームに典型的な要素を持つ場合のみ「単体送信」とみなす
+    // ※一覧行(tr)の各行フォーム(送信ボタン+textarea だけ)は除外しない
+    const action = (form.getAttribute('action') || '').toLowerCase();
+    const hasMailboxAction = action.includes('mailbox');
+    const hasFile = !!form.querySelector('input[type="file"]');
+
+    const btnTexts = Array.from(form.querySelectorAll('input[type="submit"], button, input[type="button"], a'))
+      .map(el => (el.value || el.textContent || '').trim())
+      .filter(Boolean)
+      .join(' ');
+
+    const hasSingleSendWords = /送信確認画面|確認しないで即送信|一括コピー|即時|予約/.test(btnTexts);
+    const hasScheduleSelect = !!form.querySelector('select[name*="year"], select[name*="month"], select[name*="day"], select[name*="hour"], select[name*="minute"]');
+
     const textareas = form.querySelectorAll('textarea');
-    return btns.length > 0 && textareas.length === 1;
+    const looksSingleSend = (hasMailboxAction || hasFile || hasSingleSendWords || hasScheduleSelect) && textareas.length === 1;
+    return looksSingleSend;
   }
 
   /**
@@ -328,7 +347,7 @@
   /**
    * 行(tr)から最も返信欄らしい textarea を1つ選ぶ
    */
-  function findReplyTextareaInRow(tr, win) {
+  function findReplyTextareaInRow(tr, win, docFlags) {
     if (!tr) return null;
     const textareas = tr.querySelectorAll('textarea');
     if (textareas.length === 0) return null;
@@ -340,7 +359,7 @@
       if (ta.tagName !== 'TEXTAREA') continue;
       if (isExcludedTextarea(ta)) continue;
       if (!isElementVisible(ta, win)) continue;
-      if (isInsideSingleSendForm(ta)) continue;
+      if (isInsideSingleSendForm(ta, docFlags)) continue;
 
       const score = scoreReplyTextareaCandidate(ta);
       if (score > bestScore) {
@@ -375,12 +394,14 @@
     const scopeTbody = best ? (best.tbody || $('tbody', best.table) || best.table) : null;
     const tableScore = best ? best.score : null;
 
+    const docFlags = { isBoxChar: !!isBoxCharDoc };
+
     // (1) bestTableベース: 各行から最も返信欄らしい textarea を1つ拾う
     if (scopeTbody) {
       const rows = $$('tr', scopeTbody).filter(tr => !$('th', tr));
       let rowIndex = 0;
       for (const tr of rows) {
-        const ta = findReplyTextareaInRow(tr, win);
+        const ta = findReplyTextareaInRow(tr, win, docFlags);
         if (!ta) { rowIndex++; continue; }
         if (seen.has(ta)) { rowIndex++; continue; }
         seen.add(ta);
@@ -405,7 +426,7 @@
         if (ta.tagName !== 'TEXTAREA') continue;
         if (isExcludedTextarea(ta)) continue;
         if (!isElementVisible(ta, win)) continue;
-        if (isInsideSingleSendForm(ta)) continue;
+        if (isInsideSingleSendForm(ta, docFlags)) continue;
         if (seen2.has(ta)) continue;
         seen2.add(ta);
         resultFromDoc.push({
@@ -1209,7 +1230,7 @@
 
     const d = {
       siteType: SITE_TYPE,
-      version: '2.4.5',
+      version: '2.4.6',
       pageMode: state.pageMode,
       textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where, iframeSrc: state.textarea.iframeSrc },
       rows: state.rows,
