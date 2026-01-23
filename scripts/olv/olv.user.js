@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dating Ops - OLV
 // @namespace    dating-ops-tm
-// @version      2.4.0
+// @version      2.4.2
 // @description  OLV (olv29.com) 返信アシスト - 返信欄ベース行検出 + 一括挿入機能
 // @author       Dating Ops Team
 // @match        https://olv29.com/staff/*
@@ -71,7 +71,7 @@
     excludeClassKeywords: ['admin', 'memo', 'note'],
     rowSelectors: ['tr.rowitem', 'tr[id^="row"]', 'tr[class*="row"]', 'tbody > tr', 'tr'],
     fallbackRowSelector: 'td.chatview',
-    countPatterns: [/表示\s*(\d+)\s*件/, /(\d+)\s*件/, /全\s*(\d+)/],
+    countPatterns: [/表示\s*(\d+)\s*件/, /全\s*(\d+)/, /(\d+)\s*件/],
     listHeaderKeywords: ['キャラ情報', '会話', '状況', 'ふたりメモ', 'ユーザー情報', '更新', '名前', '返信', 'ステータス', 'チェック'],
     clickTriggerSelectors: [
       'input[type="submit"][value*="更新"]', 'input[value="更新"]', '.reload-btn',
@@ -336,21 +336,82 @@
    */
   function extractDisplayCountFromDoc(doc) {
     try {
-      const bodyText = doc.body ? doc.body.innerText : '';
-      for (const pat of CONFIG.countPatterns) {
-        const m = bodyText.match(pat);
-        if (m && m[1]) {
-          const n = parseInt(m[1], 10);
-          if (!isNaN(n) && n >= 0 && n < 10000) return n;
+      // パネル(#dating-ops-panel)内の文言(例: "対象: 1件")に誤爆しやすいので除外したテキストで判定する
+      const body = doc.body;
+      if (!body) return null;
+
+      let text = '';
+      try {
+        const clone = body.cloneNode(true);
+        const panel = clone.querySelector(`#${PANEL_ID}`);
+        if (panel) panel.remove();
+        text = clone.innerText || '';
+      } catch {
+        // cloneが失敗するdocもあるので最後の手段
+        const panel = doc.getElementById?.(PANEL_ID);
+        if (panel) {
+          // panelを無視するため、panel外のテキストだけを繋ぐ
+          const parts = [];
+          for (const child of Array.from(body.children || [])) {
+            if (child && child.id === PANEL_ID) continue;
+            parts.push(child.innerText || child.textContent || '');
+          }
+          text = parts.join('\n');
+        } else {
+          text = body.innerText || '';
         }
+      }
+
+      // まず「表示 N件」を最優先（この画面の正の値）
+      const mShow = text.match(/表示\s*(\d+)\s*件/);
+      if (mShow && mShow[1]) {
+        const n = parseInt(mShow[1], 10);
+        if (!isNaN(n) && n >= 0 && n < 10000) return n;
+      }
+
+      // 次に「全 N」
+      const mAll = text.match(/全\s*(\d+)/);
+      if (mAll && mAll[1]) {
+        const n = parseInt(mAll[1], 10);
+        if (!isNaN(n) && n >= 0 && n < 10000) return n;
+      }
+
+      // 最後のfallback: 「N件」(ただし小さすぎる値(<=3)は誤爆しやすいので無視)
+      const mAny = text.match(/(\d+)\s*件/);
+      if (mAny && mAny[1]) {
+        const n = parseInt(mAny[1], 10);
+        if (!isNaN(n) && n > 3 && n < 10000) return n;
       }
     } catch {}
     return null;
   }
 
   /**
+   * mailbox iframe かどうか判定（単体返信用iframe、listモードでは最下位）
+   */
+  function isMailboxIframe(iframeSrc) {
+    if (!iframeSrc) return false;
+    const s = iframeSrc.toLowerCase();
+    return s.includes('mailbox') && (s.includes('method=empty') || s.includes('method=send'));
+  }
+
+  /**
+   * box_char iframe かどうか判定（一覧テーブル用iframe）
+   */
+  function isBoxCharIframe(iframeSrc) {
+    if (!iframeSrc) return false;
+    return iframeSrc.toLowerCase().includes('box_char');
+  }
+
+  /**
    * 全アクセス可能docから一括返信欄を検出
-   * displayCountとの差が小さいdocを優先
+   * 
+   * 【優先順位】listモード用
+   * A. textarea[name="message1"] が複数(>=2)存在する doc
+   * B. mailbox iframe は単体返信用なので listモードでは最下位
+   * C. box_char iframe を mailbox より優先
+   * D. displayCount と textarea数が近い doc
+   * E. tableScore が高い doc
    */
   function findBatchReplyTextareas() {
     const docs = getAccessibleDocs();
@@ -366,31 +427,50 @@
         scopeHint: res.scopeHint,
         tableScore: res.tableScore,
         displayCount,
+        // デバッグ用フラグ
+        isMailbox: isMailboxIframe(iframeSrc),
+        isBoxChar: isBoxCharIframe(iframeSrc),
       });
     }
 
-    // 優先順でソート:
-    // 1) textareas > 0 のdocを優先
-    // 2) displayCountが取れているなら「差が小さいdoc」を優先
-    // 3) 件数が多い方
-    // 4) tableScoreが高い
+    // ソート: listモードでは「複数textarea」を持つdocを最優先
     docResults.sort((a, b) => {
-      const aHas = a.textareas.length > 0;
-      const bHas = b.textareas.length > 0;
-      if (aHas && !bHas) return -1;
-      if (!aHas && bHas) return 1;
+      const aCount = a.textareas.length;
+      const bCount = b.textareas.length;
 
-      // displayCountが取れているなら「差が小さいdoc」を優先
+      // (1) textareas > 0 を優先
+      if (aCount > 0 && bCount === 0) return -1;
+      if (aCount === 0 && bCount > 0) return 1;
+      if (aCount === 0 && bCount === 0) return 0;
+
+      // (2) mailbox iframe は listモードでは最下位に落とす
+      //     (複数textareaがある他のdocがあればそちらを使う)
+      const aIsMailbox = a.isMailbox;
+      const bIsMailbox = b.isMailbox;
+      if (!aIsMailbox && bIsMailbox && aCount >= 2) return -1;
+      if (aIsMailbox && !bIsMailbox && bCount >= 2) return 1;
+
+      // (3) 複数(>=2)を持つdocを優先（1件のmailboxより27件のbox_charを優先）
+      const aMulti = aCount >= 2;
+      const bMulti = bCount >= 2;
+      if (aMulti && !bMulti) return -1;
+      if (!aMulti && bMulti) return 1;
+
+      // (4) box_char を mailbox より優先
+      if (a.isBoxChar && !b.isBoxChar) return -1;
+      if (!a.isBoxChar && b.isBoxChar) return 1;
+
+      // (5) displayCount との差が小さい方を優先
       const aDisp = a.displayCount;
       const bDisp = b.displayCount;
-      const aDiff = aDisp !== null ? Math.abs(a.textareas.length - aDisp) : Infinity;
-      const bDiff = bDisp !== null ? Math.abs(b.textareas.length - bDisp) : Infinity;
+      const aDiff = aDisp !== null ? Math.abs(aCount - aDisp) : Infinity;
+      const bDiff = bDisp !== null ? Math.abs(bCount - bDisp) : Infinity;
       if (aDiff !== bDiff) return aDiff - bDiff;
 
-      // 次に件数が多い方
-      if (a.textareas.length !== b.textareas.length) return b.textareas.length - a.textareas.length;
+      // (6) 件数が多い方を優先
+      if (aCount !== bCount) return bCount - aCount;
 
-      // 最後にtableScore
+      // (7) tableScore が高い方
       const aScore = a.tableScore ?? -Infinity;
       const bScore = b.tableScore ?? -Infinity;
       return bScore - aScore;
@@ -399,12 +479,14 @@
     // 最初に textareas > 0 の doc を採用
     for (const dr of docResults) {
       if (dr.textareas.length > 0) {
+        // scopeHint にどのdocを選んだか情報を追加
+        const hint = dr.scopeHint + (dr.isMailbox ? ' [mailbox]' : '') + (dr.isBoxChar ? ' [box_char]' : '');
         return {
           textareas: dr.textareas,
           count: dr.textareas.length,
           where: dr.where,
           iframeSrc: dr.iframeSrc,
-          scopeHint: dr.scopeHint,
+          scopeHint: hint,
           tableScore: dr.tableScore,
           docsSearched: docs.length,
         };
@@ -420,13 +502,8 @@
   function extractDisplayCount() {
     const docs = getAccessibleDocs();
     for (const { doc } of docs) {
-      try {
-        const bodyText = doc.body ? doc.body.innerText : '';
-        for (const pat of CONFIG.countPatterns) {
-          const m = bodyText.match(pat);
-          if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n >= 0 && n < 10000) return n; }
-        }
-      } catch {}
+      const n = extractDisplayCountFromDoc(doc);
+      if (n !== null) return n;
     }
     return null;
   }
@@ -955,7 +1032,7 @@
   function runDiagnostic() {
     const d = {
       siteType: SITE_TYPE,
-      version: '2.4.0',
+      version: '2.4.2',
       pageMode: state.pageMode,
       textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where, iframeSrc: state.textarea.iframeSrc },
       rows: state.rows,
@@ -1058,7 +1135,7 @@
   // ============================================================
   function init() {
     if (state.initialized || !location.pathname.includes('/staff/')) return;
-    logger.info('初期化開始 v2.4.0');
+    logger.info('初期化開始 v2.4.2');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';
