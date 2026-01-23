@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dating Ops - OLV
 // @namespace    dating-ops-tm
-// @version      2.4.2
+// @version      2.4.3
 // @description  OLV (olv29.com) 返信アシスト - 返信欄ベース行検出 + 一括挿入機能
 // @author       Dating Ops Team
 // @match        https://olv29.com/staff/*
@@ -271,9 +271,36 @@
   // 一括返信欄検出 (v2.4.0 新規)
   // ============================================================
 
+  // listモードの「行内返信欄」候補（nameがmessage1固定とは限らないため幅広く拾う）
+  const MESSAGE1_TEXTAREA_SELECTOR = 'textarea[name="message1"], textarea[name^="message1"], textarea[name*="message1"], textarea[id^="message1"], textarea[id*="message1"]';
+
+  function findMessage1TextareaInRow(tr) {
+    if (!tr) return null;
+    // まずは一番それっぽいものを優先
+    const ta = tr.querySelector(MESSAGE1_TEXTAREA_SELECTOR);
+    if (!ta) return null;
+    if (ta.tagName !== 'TEXTAREA') return null;
+    return ta;
+  }
+
+  function looksLikeRowReplyTextarea(ta) {
+    if (!ta) return false;
+    const tr = ta.closest('tr');
+    const table = ta.closest('table');
+    if (!tr || !table) return false;
+    // 行にチェックボックス/チャット表示っぽい要素があるなら「一覧行」の可能性が高い
+    if (tr.querySelector('input[type="checkbox"]')) return true;
+    if (tr.querySelector('td.chatview')) return true;
+    if ((tr.className || '').toLowerCase().includes('row')) return true;
+    // 最低限、tableに複数行があること
+    const tbody = table.querySelector('tbody') || table;
+    const rows = tbody.querySelectorAll('tr');
+    return rows && rows.length >= 3;
+  }
+
   /**
    * 指定doc内のスコープから返信欄を収集
-   * - bestTableの行(tr)を基準に message1 を拾う
+   * - bestTableの行(tr)を基準に message1 系(name/idにmessage1を含む)を拾う
    * - table由来が少ない場合はdoc全体からのfallbackを使用
    */
   function findBatchReplyTextareasInDoc(doc, win) {
@@ -289,14 +316,15 @@
       const rows = $$('tr', scopeTbody).filter(tr => !$('th', tr));
       let rowIndex = 0;
       for (const tr of rows) {
-        const ta = tr.querySelector('textarea[name="message1"]');
+        const ta = findMessage1TextareaInRow(tr);
         if (!ta) { rowIndex++; continue; }
+        if (!looksLikeRowReplyTextarea(ta)) { rowIndex++; continue; }
         if (ta.tagName !== 'TEXTAREA') { rowIndex++; continue; }
         if (isExcludedTextarea(ta)) { rowIndex++; continue; }
         if (!isElementVisible(ta, win)) { rowIndex++; continue; }
         if (seen.has(ta)) { rowIndex++; continue; }
         seen.add(ta);
-        resultFromTable.push({ el: ta, selector: 'textarea[name="message1"]', rowIndex, scopeHint: best ? best.hint : 'bestTable' });
+        resultFromTable.push({ el: ta, selector: MESSAGE1_TEXTAREA_SELECTOR, rowIndex, scopeHint: best ? best.hint : 'bestTable' });
         rowIndex++;
       }
     }
@@ -304,15 +332,16 @@
     // (2) doc全体ベース（可視 message1 全収集）
     const resultFromDoc = [];
     const seen2 = new Set();
-    const all = $$('textarea[name="message1"]', doc.body || doc);
+    const all = $$(MESSAGE1_TEXTAREA_SELECTOR, doc.body || doc);
     let idx = 0;
     for (const ta of all) {
       if (ta.tagName !== 'TEXTAREA') continue;
+      if (!looksLikeRowReplyTextarea(ta)) continue;
       if (isExcludedTextarea(ta)) continue;
       if (!isElementVisible(ta, win)) continue;
       if (seen2.has(ta)) continue;
       seen2.add(ta);
-      resultFromDoc.push({ el: ta, selector: 'textarea[name="message1"]', rowIndex: idx++, scopeHint: 'doc:message1' });
+      resultFromDoc.push({ el: ta, selector: MESSAGE1_TEXTAREA_SELECTOR, rowIndex: idx++, scopeHint: 'doc:message1' });
     }
 
     // (3) 採用ルール:
@@ -1032,7 +1061,7 @@
   function runDiagnostic() {
     const d = {
       siteType: SITE_TYPE,
-      version: '2.4.2',
+      version: '2.4.3',
       pageMode: state.pageMode,
       textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where, iframeSrc: state.textarea.iframeSrc },
       rows: state.rows,
@@ -1135,7 +1164,7 @@
   // ============================================================
   function init() {
     if (state.initialized || !location.pathname.includes('/staff/')) return;
-    logger.info('初期化開始 v2.4.2');
+    logger.info('初期化開始 v2.4.3');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';

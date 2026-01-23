@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dating Ops - MEM
 // @namespace    dating-ops-tm
-// @version      2.4.0
+// @version      2.4.3
 // @description  MEM (mem44.com) 返信アシスト - 返信欄ベース行検出 + 一括挿入機能
 // @author       Dating Ops Team
 // @match        https://mem44.com/staff/*
@@ -16,14 +16,16 @@
 
 /**
  * ============================================================
- * 実装メモ (v2.4.0)
+ * 実装メモ (v2.4.3)
  * ============================================================
  * 
- * 【v2.4.0 主な変更】
+ * 【v2.4.3 主な変更】
  *   - 行検出を「返信欄（textarea）数ベース」に変更
  *   - findBatchReplyTextareas() で表示中の返信欄を検出
  *   - 一括挿入ボタン「表示分に一括挿入」を追加
  *   - rows.count は batchTextareasCount を最優先に使用
+ *   - mailbox iframe より box_char/複数textarea を優先
+ *   - MESSAGE1_TEXTAREA_SELECTOR を拡張（name/id含む）
  * 
  * 【iframe対応】
  *   - getAccessibleDocs(): main + 同一オリジンiframe(ネスト含む)
@@ -272,9 +274,36 @@
   // 一括返信欄検出 (v2.4.0 新規)
   // ============================================================
 
+  // listモードの「行内返信欄」候補（nameがmessage1固定とは限らないため幅広く拾う）
+  const MESSAGE1_TEXTAREA_SELECTOR = 'textarea[name="message1"], textarea[name^="message1"], textarea[name*="message1"], textarea[id^="message1"], textarea[id*="message1"]';
+
+  function findMessage1TextareaInRow(tr) {
+    if (!tr) return null;
+    // まずは一番それっぽいものを優先
+    const ta = tr.querySelector(MESSAGE1_TEXTAREA_SELECTOR);
+    if (!ta) return null;
+    if (ta.tagName !== 'TEXTAREA') return null;
+    return ta;
+  }
+
+  function looksLikeRowReplyTextarea(ta) {
+    if (!ta) return false;
+    const tr = ta.closest('tr');
+    const table = ta.closest('table');
+    if (!tr || !table) return false;
+    // 行にチェックボックス/チャット表示っぽい要素があるなら「一覧行」の可能性が高い
+    if (tr.querySelector('input[type="checkbox"]')) return true;
+    if (tr.querySelector('td.chatview')) return true;
+    if ((tr.className || '').toLowerCase().includes('row')) return true;
+    // 最低限、tableに複数行があること
+    const tbody = table.querySelector('tbody') || table;
+    const rows = tbody.querySelectorAll('tr');
+    return rows && rows.length >= 3;
+  }
+
   /**
    * 指定doc内のスコープから返信欄を収集
-   * - bestTableの行(tr)を基準に message1 を拾う
+   * - bestTableの行(tr)を基準に message1 系(name/idにmessage1を含む)を拾う
    * - table由来が少ない場合はdoc全体からのfallbackを使用
    */
   function findBatchReplyTextareasInDoc(doc, win) {
@@ -290,14 +319,15 @@
       const rows = $$('tr', scopeTbody).filter(tr => !$('th', tr));
       let rowIndex = 0;
       for (const tr of rows) {
-        const ta = tr.querySelector('textarea[name="message1"]');
+        const ta = findMessage1TextareaInRow(tr);
         if (!ta) { rowIndex++; continue; }
+        if (!looksLikeRowReplyTextarea(ta)) { rowIndex++; continue; }
         if (ta.tagName !== 'TEXTAREA') { rowIndex++; continue; }
         if (isExcludedTextarea(ta)) { rowIndex++; continue; }
         if (!isElementVisible(ta, win)) { rowIndex++; continue; }
         if (seen.has(ta)) { rowIndex++; continue; }
         seen.add(ta);
-        resultFromTable.push({ el: ta, selector: 'textarea[name="message1"]', rowIndex, scopeHint: best ? best.hint : 'bestTable' });
+        resultFromTable.push({ el: ta, selector: MESSAGE1_TEXTAREA_SELECTOR, rowIndex, scopeHint: best ? best.hint : 'bestTable' });
         rowIndex++;
       }
     }
@@ -305,15 +335,16 @@
     // (2) doc全体ベース（可視 message1 全収集）
     const resultFromDoc = [];
     const seen2 = new Set();
-    const all = $$('textarea[name="message1"]', doc.body || doc);
+    const all = $$(MESSAGE1_TEXTAREA_SELECTOR, doc.body || doc);
     let idx = 0;
     for (const ta of all) {
       if (ta.tagName !== 'TEXTAREA') continue;
+      if (!looksLikeRowReplyTextarea(ta)) continue;
       if (isExcludedTextarea(ta)) continue;
       if (!isElementVisible(ta, win)) continue;
       if (seen2.has(ta)) continue;
       seen2.add(ta);
-      resultFromDoc.push({ el: ta, selector: 'textarea[name="message1"]', rowIndex: idx++, scopeHint: 'doc:message1' });
+      resultFromDoc.push({ el: ta, selector: MESSAGE1_TEXTAREA_SELECTOR, rowIndex: idx++, scopeHint: 'doc:message1' });
     }
 
     // (3) 採用ルール:
@@ -350,8 +381,26 @@
   }
 
   /**
+   * mailbox iframe かどうか判定（listモードでは最下位扱い）
+   */
+  function isMailboxIframe(iframeSrc) {
+    if (!iframeSrc) return false;
+    const s = String(iframeSrc).toLowerCase();
+    return s.includes('mailbox') || s.includes('method=empty');
+  }
+
+  /**
+   * box_char iframe かどうか判定（一覧テーブルを持つ方）
+   */
+  function isBoxCharIframe(iframeSrc) {
+    if (!iframeSrc) return false;
+    const s = String(iframeSrc).toLowerCase();
+    return s.includes('box_char');
+  }
+
+  /**
    * 全アクセス可能docから一括返信欄を検出
-   * displayCountとの差が小さいdocを優先
+   * v2.4.2: mailbox iframeよりbox_char/複数textareaを優先
    */
   function findBatchReplyTextareas() {
     const docs = getAccessibleDocs();
@@ -370,28 +419,52 @@
       });
     }
 
-    // 優先順でソート:
-    // 1) textareas > 0 のdocを優先
-    // 2) displayCountが取れているなら「差が小さいdoc」を優先
-    // 3) 件数が多い方
-    // 4) tableScoreが高い
+    /**
+     * 優先順位（v2.4.2 修正）:
+     * (1) textareas > 0 のdocを優先
+     * (2) mailbox iframe は listモードでは最下位（複数textareaがある他docがあれば排除）
+     * (3) 複数(>=2)を持つdocを優先（1件のmailboxより27件のbox_charを優先）
+     * (4) box_char を mailbox より優先
+     * (5) displayCount との差が小さい方
+     * (6) 件数が多い方
+     * (7) tableScore が高い方
+     */
     docResults.sort((a, b) => {
       const aHas = a.textareas.length > 0;
       const bHas = b.textareas.length > 0;
       if (aHas && !bHas) return -1;
       if (!aHas && bHas) return 1;
 
-      // displayCountが取れているなら「差が小さいdoc」を優先
+      // (2) mailbox iframe を最下位に（listモードで複数textareaがある他docがあれば排除）
+      const aIsMailbox = isMailboxIframe(a.iframeSrc);
+      const bIsMailbox = isMailboxIframe(b.iframeSrc);
+      // 片方だけ mailbox なら、mailbox でない方を優先
+      if (aIsMailbox && !bIsMailbox && b.textareas.length >= 2) return 1;
+      if (!aIsMailbox && bIsMailbox && a.textareas.length >= 2) return -1;
+
+      // (3) 複数(>=2)を持つdocを優先（1件docより複数件docを優先）
+      const aMultiple = a.textareas.length >= 2;
+      const bMultiple = b.textareas.length >= 2;
+      if (aMultiple && !bMultiple) return -1;
+      if (!aMultiple && bMultiple) return 1;
+
+      // (4) box_char を mailbox より優先
+      const aIsBoxChar = isBoxCharIframe(a.iframeSrc);
+      const bIsBoxChar = isBoxCharIframe(b.iframeSrc);
+      if (aIsBoxChar && bIsMailbox) return -1;
+      if (bIsBoxChar && aIsMailbox) return 1;
+
+      // (5) displayCount との差が小さい方
       const aDisp = a.displayCount;
       const bDisp = b.displayCount;
       const aDiff = aDisp !== null ? Math.abs(a.textareas.length - aDisp) : Infinity;
       const bDiff = bDisp !== null ? Math.abs(b.textareas.length - bDisp) : Infinity;
       if (aDiff !== bDiff) return aDiff - bDiff;
 
-      // 次に件数が多い方
+      // (6) 件数が多い方
       if (a.textareas.length !== b.textareas.length) return b.textareas.length - a.textareas.length;
 
-      // 最後にtableScore
+      // (7) tableScore が高い方
       const aScore = a.tableScore ?? -Infinity;
       const bScore = b.tableScore ?? -Infinity;
       return bScore - aScore;
@@ -400,12 +473,16 @@
     // 最初に textareas > 0 の doc を採用
     for (const dr of docResults) {
       if (dr.textareas.length > 0) {
+        // scopeHint にどの iframe を採用したかを付記（デバッグ用）
+        let hint = dr.scopeHint;
+        if (isMailboxIframe(dr.iframeSrc)) hint += ' [mailbox]';
+        if (isBoxCharIframe(dr.iframeSrc)) hint += ' [box_char]';
         return {
           textareas: dr.textareas,
           count: dr.textareas.length,
           where: dr.where,
           iframeSrc: dr.iframeSrc,
-          scopeHint: dr.scopeHint,
+          scopeHint: hint,
           tableScore: dr.tableScore,
           docsSearched: docs.length,
         };
@@ -947,7 +1024,7 @@
   function runDiagnostic() {
     const d = {
       siteType: SITE_TYPE,
-      version: '2.4.0',
+      version: '2.4.3',
       pageMode: state.pageMode,
       textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where, iframeSrc: state.textarea.iframeSrc },
       rows: state.rows,
@@ -1050,7 +1127,7 @@
   // ============================================================
   function init() {
     if (state.initialized || !location.pathname.includes('/staff/')) return;
-    logger.info('初期化開始 v2.4.0');
+    logger.info('初期化開始 v2.4.3');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';
