@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Dating Ops - MEM
 // @namespace    dating-ops-tm
-// @version      2.3.1
-// @description  MEM (mem44.com) 返信アシスト - list scope fix + robust table detection
+// @version      2.4.0
+// @description  MEM (mem44.com) 返信アシスト - 返信欄ベース行検出 + 一括挿入機能
 // @author       Dating Ops Team
 // @match        https://mem44.com/staff/*
 // @match        https://*.mem44.com/staff/*
@@ -16,14 +16,18 @@
 
 /**
  * ============================================================
- * 実装メモ (v2.3.1)
+ * 実装メモ (v2.4.0)
  * ============================================================
  * 
- * 【行検出 - スコアリング方式】
- *   - getAllTables() で全table取得
- *   - scoreListTable() で各tableをスコアリング
- *   - findBestListTable() で最高スコアのtableを選択
- *   - score基準: 行数, checkbox, ヘッダーキーワード
+ * 【v2.4.0 主な変更】
+ *   - 行検出を「返信欄（textarea）数ベース」に変更
+ *   - findBatchReplyTextareas() で表示中の返信欄を検出
+ *   - 一括挿入ボタン「表示分に一括挿入」を追加
+ *   - rows.count は batchTextareasCount を最優先に使用
+ * 
+ * 【iframe対応】
+ *   - getAccessibleDocs(): main + 同一オリジンiframe(ネスト含む)
+ *   - 行検出/テーブルスコアリングをdoc横断で実行
  * 
  * 【返信欄検出】
  *   - textarea[name="message1"] 最優先
@@ -39,7 +43,6 @@
   // 定数
   // ============================================================
   const SITE_TYPE = 'mem';
-  const SITE_NAME = 'MEM';
   const PANEL_ID = 'dating-ops-panel';
   const STORAGE_PREFIX = 'datingOps_mem_';
   const OBSERVER_DEBOUNCE_MS = 300;
@@ -68,6 +71,7 @@
     excludeKeywords: ['memo', 'admin', 'note', 'futari', 'two_memo', 'staff'],
     excludeClassKeywords: ['admin', 'memo', 'note'],
     rowSelectors: ['tr.rowitem', 'tr[id^="row"]', 'tr[class*="row"]', 'tbody > tr', 'tr'],
+    fallbackRowSelector: 'td.chatview',
     countPatterns: [/表示\s*(\d+)\s*件/, /(\d+)\s*件/, /全\s*(\d+)/],
     listHeaderKeywords: ['キャラ情報', '会話', '状況', 'ふたりメモ', 'ユーザー情報', '更新', '名前', '返信', 'ステータス', 'チェック'],
     clickTriggerSelectors: [
@@ -87,7 +91,7 @@
     initialized: false,
     stopped: false,
     panel: null,
-    observer: null,
+    observers: [],
     healthTimer: null,
     urlPollTimer: null,
     stagedDetectIndex: 0,
@@ -95,7 +99,18 @@
     lastUrl: '',
     pageMode: 'other',
     textarea: { status: 'pending', element: null, selector: null, where: null, iframeSrc: null },
-    rows: { count: 0, displayCountNum: null, scopeHint: null, usedSelector: null, mismatchWarning: null, tableScore: null },
+    rows: {
+      count: 0,
+      batchTextareasCount: 0,
+      displayCountNum: null,
+      scopeHint: null,
+      usedSelector: null,
+      mismatchWarning: null,
+      tableScore: null,
+      where: null,
+      iframeSrc: null,
+      docsSearched: 0,
+    },
     lastDetectTime: null,
     lastTrigger: null,
     messages: [],
@@ -105,7 +120,8 @@
     panelPos: { x: 20, y: 20 },
     dragging: false,
     dragOffset: { x: 0, y: 0 },
-    observeTargetHint: null,
+    observeTargetHints: [],
+    iframeLoadListeners: new WeakSet(),
   };
 
   // ============================================================
@@ -133,6 +149,51 @@
   function storageSet(k, v) { try { localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); } catch {} }
   function escapeHtml(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
   function formatTime(ts) { if (!ts) return '--:--:--'; return new Date(ts).toTimeString().substring(0, 8); }
+
+  // ============================================================
+  // アクセス可能なドキュメント一覧取得 (再帰的iframe探索)
+  // ============================================================
+  const debouncedReInit = debounce(() => {
+    if (state.stopped) return;
+    logger.info('iframe load → 再初期化');
+    startObservers();
+    runStagedDetection();
+  }, 500);
+
+  function getAccessibleDocs() {
+    const docs = [];
+    const seenDocs = new WeakSet();
+
+    function addDoc(doc, win, where, iframeSrc) {
+      if (!doc || seenDocs.has(doc)) return;
+      seenDocs.add(doc);
+      docs.push({ doc, win, where, iframeSrc });
+    }
+
+    function scanDocForIframes(baseDoc) {
+      let iframes = [];
+      try { iframes = Array.from(baseDoc.querySelectorAll('iframe')); } catch { iframes = []; }
+      for (const iframe of iframes) {
+        if (!state.iframeLoadListeners.has(iframe)) {
+          state.iframeLoadListeners.add(iframe);
+          iframe.addEventListener('load', debouncedReInit, { once: true });
+        }
+        try {
+          const doc = iframe.contentDocument;
+          const win = iframe.contentWindow;
+          if (doc && win) {
+            const src = iframe.src || iframe.name || iframe.id || 'iframe';
+            addDoc(doc, win, 'iframe', src);
+            scanDocForIframes(doc);
+          }
+        } catch { /* cross-origin */ }
+      }
+    }
+
+    addDoc(document, window, 'main', null);
+    scanDocForIframes(document);
+    return docs;
+  }
 
   // ============================================================
   // ページモード判定
@@ -168,12 +229,9 @@
   }
 
   // ============================================================
-  // テーブルスコアリング (v2.3.1 新規追加)
+  // テーブルスコアリング
   // ============================================================
-  
-  function getAllTables(doc) {
-    return $$('table', doc || document);
-  }
+  function getAllTables(doc) { return $$('table', doc || document); }
 
   function scoreListTable(table) {
     if (!table) return 0;
@@ -190,18 +248,15 @@
     if ($('tr.rowitem', table)) score += 10;
     const headerText = ($$('th', table).map(th => th.textContent || '').join(' ') +
                         $$('thead td', table).map(td => td.textContent || '').join(' ')).toLowerCase();
-    for (const kw of CONFIG.listHeaderKeywords) {
-      if (headerText.includes(kw.toLowerCase())) { score += 5; break; }
-    }
+    for (const kw of CONFIG.listHeaderKeywords) { if (headerText.includes(kw.toLowerCase())) { score += 5; break; } }
     if (table.parentElement?.tagName === 'FORM') score -= 10;
     try { const rect = table.getBoundingClientRect(); if (rect.width < 300) score -= 15; } catch {}
     return score;
   }
 
-  function findBestListTable() {
-    const tables = getAllTables();
-    let best = null;
-    let bestScore = -Infinity;
+  function findBestListTableInDoc(doc) {
+    const tables = getAllTables(doc);
+    let best = null, bestScore = -Infinity;
     for (const table of tables) {
       const score = scoreListTable(table);
       if (score > bestScore) { bestScore = score; best = table; }
@@ -214,73 +269,274 @@
   }
 
   // ============================================================
-  // scope特定（行検出用）- 改良版
+  // 一括返信欄検出 (v2.4.0 新規)
   // ============================================================
-  function findRowScope() {
-    const best = findBestListTable();
-    if (best) {
-      logger.info(`[Scope] bestTable採用 score=${best.score}`);
-      return { el: best.tbody, hint: best.hint, tableScore: best.score };
+
+  /**
+   * 指定doc内のスコープから返信欄を収集
+   * - bestTableの行(tr)を基準に message1 を拾う
+   * - table由来が少ない場合はdoc全体からのfallbackを使用
+   */
+  function findBatchReplyTextareasInDoc(doc, win) {
+    const resultFromTable = [];
+    const seen = new Set();
+
+    const best = findBestListTableInDoc(doc);
+    const scopeTbody = best ? (best.tbody || $('tbody', best.table) || best.table) : null;
+    const tableScore = best ? best.score : null;
+
+    // (1) bestTableベース
+    if (scopeTbody) {
+      const rows = $$('tr', scopeTbody).filter(tr => !$('th', tr));
+      let rowIndex = 0;
+      for (const tr of rows) {
+        const ta = tr.querySelector('textarea[name="message1"]');
+        if (!ta) { rowIndex++; continue; }
+        if (ta.tagName !== 'TEXTAREA') { rowIndex++; continue; }
+        if (isExcludedTextarea(ta)) { rowIndex++; continue; }
+        if (!isElementVisible(ta, win)) { rowIndex++; continue; }
+        if (seen.has(ta)) { rowIndex++; continue; }
+        seen.add(ta);
+        resultFromTable.push({ el: ta, selector: 'textarea[name="message1"]', rowIndex, scopeHint: best ? best.hint : 'bestTable' });
+        rowIndex++;
+      }
     }
-    const cv = $('td.chatview');
-    if (cv) { const t = cv.closest('table'); if (t) return { el: $('tbody', t) || t, hint: 'td.chatview → table', tableScore: null }; }
-    const ri = $('tr.rowitem');
-    if (ri) { const t = ri.closest('table'); if (t) return { el: $('tbody', t) || t, hint: 'tr.rowitem → table', tableScore: null }; }
-    const cbs = $$('table input[type="checkbox"]');
-    if (cbs.length >= 2) { const t = cbs[0].closest('table'); if (t) return { el: $('tbody', t) || t, hint: `checkbox(${cbs.length}) → table`, tableScore: null }; }
-    logger.warn('[Scope] fallback to body');
-    return { el: document.body, hint: 'fallback: body', tableScore: null };
+
+    // (2) doc全体ベース（可視 message1 全収集）
+    const resultFromDoc = [];
+    const seen2 = new Set();
+    const all = $$('textarea[name="message1"]', doc.body || doc);
+    let idx = 0;
+    for (const ta of all) {
+      if (ta.tagName !== 'TEXTAREA') continue;
+      if (isExcludedTextarea(ta)) continue;
+      if (!isElementVisible(ta, win)) continue;
+      if (seen2.has(ta)) continue;
+      seen2.add(ta);
+      resultFromDoc.push({ el: ta, selector: 'textarea[name="message1"]', rowIndex: idx++, scopeHint: 'doc:message1' });
+    }
+
+    // (3) 採用ルール:
+    // - table由来が 0〜2件しか無いのに、doc全体が >=3件あるなら doc全体を採用
+    // - それ以外は table由来を優先（0件ならdoc全体）
+    let chosen = resultFromTable;
+    let scopeHint = best ? best.hint : 'doc.body';
+    if (resultFromTable.length === 0) {
+      chosen = resultFromDoc;
+      scopeHint = 'doc:message1';
+    } else if (resultFromTable.length <= 2 && resultFromDoc.length >= 3) {
+      chosen = resultFromDoc;
+      scopeHint = 'doc:message1(fallback)';
+    }
+
+    return { textareas: chosen, scopeHint, tableScore };
   }
 
-  function countRowsInScope(scopeEl) {
-    for (const sel of CONFIG.rowSelectors) {
-      try { const rows = $$(sel, scopeEl).filter(tr => !$('th', tr)); if (rows.length > 0) return { count: rows.length, selector: sel }; } catch {}
-    }
-    return { count: 0, selector: null };
+  /**
+   * 指定doc内の表示件数を抽出
+   */
+  function extractDisplayCountFromDoc(doc) {
+    try {
+      const bodyText = doc.body ? doc.body.innerText : '';
+      for (const pat of CONFIG.countPatterns) {
+        const m = bodyText.match(pat);
+        if (m && m[1]) {
+          const n = parseInt(m[1], 10);
+          if (!isNaN(n) && n >= 0 && n < 10000) return n;
+        }
+      }
+    } catch {}
+    return null;
   }
 
+  /**
+   * 全アクセス可能docから一括返信欄を検出
+   * displayCountとの差が小さいdocを優先
+   */
+  function findBatchReplyTextareas() {
+    const docs = getAccessibleDocs();
+
+    // 各docのスコアと返信欄情報を収集
+    const docResults = [];
+    for (const { doc, win, where, iframeSrc } of docs) {
+      const res = findBatchReplyTextareasInDoc(doc, win);
+      const displayCount = extractDisplayCountFromDoc(doc);
+      docResults.push({
+        doc, win, where, iframeSrc,
+        textareas: res.textareas,
+        scopeHint: res.scopeHint,
+        tableScore: res.tableScore,
+        displayCount,
+      });
+    }
+
+    // 優先順でソート:
+    // 1) textareas > 0 のdocを優先
+    // 2) displayCountが取れているなら「差が小さいdoc」を優先
+    // 3) 件数が多い方
+    // 4) tableScoreが高い
+    docResults.sort((a, b) => {
+      const aHas = a.textareas.length > 0;
+      const bHas = b.textareas.length > 0;
+      if (aHas && !bHas) return -1;
+      if (!aHas && bHas) return 1;
+
+      // displayCountが取れているなら「差が小さいdoc」を優先
+      const aDisp = a.displayCount;
+      const bDisp = b.displayCount;
+      const aDiff = aDisp !== null ? Math.abs(a.textareas.length - aDisp) : Infinity;
+      const bDiff = bDisp !== null ? Math.abs(b.textareas.length - bDisp) : Infinity;
+      if (aDiff !== bDiff) return aDiff - bDiff;
+
+      // 次に件数が多い方
+      if (a.textareas.length !== b.textareas.length) return b.textareas.length - a.textareas.length;
+
+      // 最後にtableScore
+      const aScore = a.tableScore ?? -Infinity;
+      const bScore = b.tableScore ?? -Infinity;
+      return bScore - aScore;
+    });
+
+    // 最初に textareas > 0 の doc を採用
+    for (const dr of docResults) {
+      if (dr.textareas.length > 0) {
+        return {
+          textareas: dr.textareas,
+          count: dr.textareas.length,
+          where: dr.where,
+          iframeSrc: dr.iframeSrc,
+          scopeHint: dr.scopeHint,
+          tableScore: dr.tableScore,
+          docsSearched: docs.length,
+        };
+      }
+    }
+
+    return { textareas: [], count: 0, where: null, iframeSrc: null, scopeHint: 'none', tableScore: null, docsSearched: docs.length };
+  }
+
+  // ============================================================
+  // 表示件数抽出
+  // ============================================================
   function extractDisplayCount() {
-    const bodyText = document.body ? document.body.innerText : '';
-    for (const pat of CONFIG.countPatterns) {
-      const m = bodyText.match(pat);
-      if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n >= 0 && n < 10000) return n; }
+    const docs = getAccessibleDocs();
+    for (const { doc } of docs) {
+      try {
+        const bodyText = doc.body ? doc.body.innerText : '';
+        for (const pat of CONFIG.countPatterns) {
+          const m = bodyText.match(pat);
+          if (m && m[1]) { const n = parseInt(m[1], 10); if (!isNaN(n) && n >= 0 && n < 10000) return n; }
+        }
+      } catch {}
     }
     return null;
   }
 
   // ============================================================
-  // 行検出
+  // 行検出 (v2.4.0: 返信欄ベース最優先)
   // ============================================================
   function detectRows() {
     if (state.pageMode !== 'list') {
-      state.rows = { count: state.pageMode === 'personal' ? 1 : 0, displayCountNum: null, scopeHint: 'N/A (not list mode)', usedSelector: null, mismatchWarning: null, tableScore: null };
+      state.rows = {
+        count: state.pageMode === 'personal' ? 1 : 0,
+        batchTextareasCount: 0,
+        displayCountNum: null,
+        scopeHint: 'N/A (not list mode)',
+        usedSelector: null,
+        mismatchWarning: null,
+        tableScore: null,
+        where: null,
+        iframeSrc: null,
+        docsSearched: 0,
+      };
       return;
     }
-    const scope = findRowScope();
-    const res = countRowsInScope(scope.el);
+
     const dispNum = extractDisplayCount();
-    let warn = null;
-    if (dispNum !== null && res.count === 0 && dispNum > 0) warn = '行セレクタ不一致';
-    else if (dispNum !== null && dispNum > 0 && Math.abs(res.count - dispNum) >= 5) warn = 'scope誤認の可能性';
-    state.rows = { count: res.count, displayCountNum: dispNum, scopeHint: scope.hint, usedSelector: res.selector, mismatchWarning: warn, tableScore: scope.tableScore };
+    const batchResult = findBatchReplyTextareas();
+
+    if (batchResult.count > 0) {
+      let warn = null;
+      if (dispNum !== null && dispNum > 0) {
+        if (batchResult.count === 0) {
+          warn = '返信欄未描画または検出失敗';
+        } else if (Math.abs(batchResult.count - dispNum) >= 5) {
+          warn = 'ページング/折り畳み/スクロール外の可能性';
+        }
+      }
+
+      state.rows = {
+        count: batchResult.count,
+        batchTextareasCount: batchResult.count,
+        displayCountNum: dispNum,
+        scopeHint: `batchTextareas(${batchResult.scopeHint})`,
+        usedSelector: 'textarea-batch',
+        mismatchWarning: warn,
+        tableScore: batchResult.tableScore,
+        where: batchResult.where,
+        iframeSrc: batchResult.iframeSrc,
+        docsSearched: batchResult.docsSearched,
+      };
+      logger.info(`[Rows] 返信欄ベース: ${batchResult.count}件 (${batchResult.where})`);
+      return;
+    }
+
+    const docs = getAccessibleDocs();
+    for (const { doc, where, iframeSrc } of docs) {
+      const best = findBestListTableInDoc(doc);
+      if (best) {
+        const rows = $$('tr', best.tbody).filter(tr => !$('th', tr));
+        if (rows.length > 0) {
+          let warn = '返信欄未検出 (trカウントfallback)';
+          if (dispNum !== null && dispNum > 0 && Math.abs(rows.length - dispNum) >= 5) {
+            warn = 'scope誤認の可能性 (trカウントfallback)';
+          }
+          state.rows = {
+            count: rows.length,
+            batchTextareasCount: 0,
+            displayCountNum: dispNum,
+            scopeHint: `fallback-tr(${best.hint})`,
+            usedSelector: 'tbody > tr (fallback)',
+            mismatchWarning: warn,
+            tableScore: best.score,
+            where, iframeSrc,
+            docsSearched: docs.length,
+          };
+          logger.warn(`[Rows] fallback: tr=${rows.length}件 (返信欄は0)`);
+          return;
+        }
+      }
+    }
+
+    state.rows = {
+      count: 0,
+      batchTextareasCount: 0,
+      displayCountNum: dispNum,
+      scopeHint: 'not found',
+      usedSelector: null,
+      mismatchWarning: dispNum !== null && dispNum > 0 ? '返信欄未描画または検出失敗' : null,
+      tableScore: null,
+      where: null,
+      iframeSrc: null,
+      docsSearched: docs.length,
+    };
+    logger.warn(`[Rows] 全${docs.length}doc探索したが返信欄0`);
   }
 
   // ============================================================
-  // 返信欄検出
+  // 返信欄検出 (単体用)
   // ============================================================
   function findReplyTextarea() {
-    for (const sel of CONFIG.textareaSelectors) {
-      for (const el of $$(sel)) { if (!isExcludedTextarea(el) && isElementVisible(el)) return { element: el, selector: sel, where: 'main', iframeSrc: null }; }
-    }
-    for (const iframe of $$('iframe')) {
-      try {
-        const doc = iframe.contentDocument || iframe.contentWindow?.document;
-        if (!doc) continue;
-        const win = iframe.contentWindow;
-        const src = iframe.src || iframe.name || 'iframe';
-        for (const sel of CONFIG.textareaSelectors) { for (const el of $$(sel, doc)) { if (!isExcludedTextarea(el) && isElementVisible(el, win)) return { element: el, selector: sel, where: 'iframe', iframeSrc: src }; } }
-        if (doc.body?.contentEditable === 'true') return { element: doc.body, selector: 'body[contenteditable]', where: 'iframe', iframeSrc: src };
-      } catch {}
+    const docs = getAccessibleDocs();
+    for (const { doc, win, where, iframeSrc } of docs) {
+      for (const sel of CONFIG.textareaSelectors) {
+        for (const el of $$(sel, doc)) {
+          if (!isExcludedTextarea(el) && isElementVisible(el, win)) {
+            return { element: el, selector: sel, where, iframeSrc };
+          }
+        }
+      }
+      try { if (doc.body?.contentEditable === 'true') return { element: doc.body, selector: 'body[contenteditable]', where, iframeSrc }; } catch {}
     }
     return null;
   }
@@ -302,7 +558,7 @@
     detectTextarea();
     state.lastDetectTime = Date.now();
     state.lastTrigger = trigger || 'manual';
-    logger.info(`検出 [${trigger}] mode=${state.pageMode} rows=${state.rows.count} ta=${state.textarea.status} scope=${state.rows.scopeHint}`);
+    logger.info(`検出 [${trigger}] mode=${state.pageMode} rows=${state.rows.count}(${state.rows.usedSelector || '-'}) ta=${state.textarea.status}`);
     updateUI();
   }
 
@@ -323,7 +579,7 @@
   }
 
   // ============================================================
-  // テキスト挿入
+  // テキスト挿入（単体用）
   // ============================================================
   function insertText(text) {
     const el = state.textarea.element;
@@ -332,10 +588,80 @@
     const cur = (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') ? el.value : (el.textContent || el.innerHTML || '');
     if (cur && cur.length > 0) { showNotify('既にテキストが入力されています', 'warn'); return false; }
     try {
-      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') { el.value = text; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
-      else { el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>'); el.dispatchEvent(new Event('input', { bubbles: true })); }
-      el.focus(); showNotify('挿入しました', 'success'); return true;
-    } catch (e) { showNotify('挿入失敗', 'error'); return false; }
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        el.value = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      el.focus();
+      showNotify('挿入しました', 'success');
+      return true;
+    } catch { showNotify('挿入失敗', 'error'); return false; }
+  }
+
+  // ============================================================
+  // テキスト挿入（要素指定、一括用）
+  // ============================================================
+  function insertTextToElement(el, text) {
+    if (!el || el.tagName !== 'TEXTAREA') return false;
+    if (isExcludedTextarea(el)) return false;
+    const cur = el.value || '';
+    if (cur.length > 0) return false;
+    try {
+      el.value = text;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    } catch { return false; }
+  }
+
+  // ============================================================
+  // 一括挿入 (v2.4.0 新規)
+  // ============================================================
+  function batchInsertVisible() {
+    if (state.pageMode !== 'list') {
+      showNotify('一括送信モード以外では使用できません', 'warn');
+      return;
+    }
+    if (state.messages.length === 0) {
+      showNotify('メッセージがありません', 'warn');
+      return;
+    }
+
+    const batchResult = findBatchReplyTextareas();
+    if (batchResult.count === 0) {
+      showNotify('表示中の返信欄が見つかりません', 'warn');
+      return;
+    }
+
+    let inserted = 0;
+    let skipped = 0;
+    let msgIndex = 0;
+    let lastInsertedEl = null;
+
+    for (const item of batchResult.textareas) {
+      if (msgIndex >= state.messages.length) break;
+      const el = item.el;
+      const text = state.messages[msgIndex];
+      if (insertTextToElement(el, text)) {
+        inserted++;
+        lastInsertedEl = el;
+        msgIndex++;
+      } else {
+        skipped++;
+      }
+    }
+
+    if (lastInsertedEl) {
+      try { lastInsertedEl.focus(); } catch {}
+    }
+
+    const remaining = state.messages.length - msgIndex;
+    showNotify(`挿入${inserted}件 / スキップ${skipped}件 / 残${remaining}件`, inserted > 0 ? 'success' : 'warn');
+    logger.info(`[BatchInsert] 挿入=${inserted}, スキップ=${skipped}, 残メッセージ=${remaining}`);
   }
 
   // ============================================================
@@ -350,8 +676,73 @@
     return u;
   }
 
-  function parseCsv(csv) {
-    return csv.split('\n').map(line => { const t = line.trim(); if (!t) return null; if (t.startsWith('"')) { const end = t.indexOf('",'); if (end > 0) return t.substring(1, end).replace(/""/g, '"'); if (t.endsWith('"')) return t.slice(1, -1).replace(/""/g, '"'); } const c = t.indexOf(','); return c > 0 ? t.substring(0, c) : t; }).filter(Boolean).map(s => s.trim()).filter(Boolean);
+  function parseCsv(csvText) {
+    if (!csvText) return [];
+
+    // 最低限のCSVパーサ（引用符対応）
+    const rows = [];
+    let row = [];
+    let cur = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < csvText.length; i++) {
+      const ch = csvText[i];
+      const next = csvText[i + 1];
+
+      if (inQuotes) {
+        if (ch === '"' && next === '"') { // escaped quote
+          cur += '"';
+          i++;
+        } else if (ch === '"') {
+          inQuotes = false;
+        } else {
+          cur += ch;
+        }
+        continue;
+      }
+
+      if (ch === '"') { inQuotes = true; continue; }
+      if (ch === ',') { row.push(cur); cur = ''; continue; }
+      if (ch === '\r') { continue; }
+      if (ch === '\n') {
+        row.push(cur);
+        rows.push(row);
+        row = [];
+        cur = '';
+        continue;
+      }
+      cur += ch;
+    }
+
+    // last cell
+    row.push(cur);
+    rows.push(row);
+
+    // B列（index=1）優先。無ければA列。
+    // 先頭行のみヘッダー判定（本文に「メッセージ」「内容」が含まれても落とさない）
+    const out = [];
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      const r = rows[rowIndex];
+      if (!r) continue;
+      const a = (r[0] ?? '').trim();
+      const b = (r[1] ?? '').trim();
+
+      // 空行スキップ
+      if (!a && !b) continue;
+
+      // 先頭行のみヘッダー判定
+      if (rowIndex === 0) {
+        const aIsHeader = /^(番号|no\.?|no)$/i.test(a);
+        const bIsHeader = /(メッセージ|内容)/.test(b);
+        if (aIsHeader && bIsHeader) continue;
+      }
+
+      const msg = (b || a).trim();
+      if (!msg) continue;
+      out.push(msg);
+    }
+
+    return out;
   }
 
   function fetchSheet(url) {
@@ -363,8 +754,8 @@
       GM_xmlhttpRequest({
         method: 'GET', url: normalized, timeout: 15000,
         onload: function(res) {
-          if (res.status >= 200 && res.status < 300) { const msgs = parseCsv(res.responseText); if (msgs.length === 0) { state.sheetStatus = 'error'; state.sheetError = 'データがありません'; } else { state.messages = msgs; state.sheetUrl = url; state.sheetStatus = 'success'; storageSet('sheetUrl', url); storageSet('messages', msgs); showNotify(`${msgs.length}件読み込み`, 'success'); logger.info(`Sheet読み込み成功: ${msgs.length}件`); } }
-          else if (res.status === 403) { state.sheetStatus = 'error'; state.sheetError = '権限エラー(403): シートを公開してください'; }
+          if (res.status >= 200 && res.status < 300) { const msgs = parseCsv(res.responseText); if (msgs.length === 0) { state.sheetStatus = 'error'; state.sheetError = 'データがありません'; } else { state.messages = msgs; state.sheetUrl = url; state.sheetStatus = 'success'; storageSet('sheetUrl', url); storageSet('messages', msgs); showNotify(`${msgs.length}件読み込み`, 'success'); } }
+          else if (res.status === 403) { state.sheetStatus = 'error'; state.sheetError = '権限エラー(403)'; }
           else if (res.status === 404) { state.sheetStatus = 'error'; state.sheetError = 'シート未発見(404)'; }
           else { state.sheetStatus = 'error'; state.sheetError = `HTTPエラー: ${res.status}`; }
           updateUI();
@@ -428,6 +819,8 @@
       #${PANEL_ID} .btn-sec{background:#45475a;color:#cdd6f4}
       #${PANEL_ID} .btn-sec:hover{background:#585b70}
       #${PANEL_ID} .btn-red{background:#f38ba8;color:#1e1e2e}
+      #${PANEL_ID} .btn-grn{background:#a6e3a1;color:#1e1e2e}
+      #${PANEL_ID} .btn-grn:hover{background:#7bc96f}
       #${PANEL_ID} .msg-list{max-height:120px;overflow-y:auto;background:#313244;border-radius:4px}
       #${PANEL_ID} .msg-item{padding:6px 8px;border-bottom:1px solid #45475a;cursor:pointer;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #${PANEL_ID} .msg-item:last-child{border-bottom:none}
@@ -447,23 +840,35 @@
     const pm = state.pageMode, r = state.rows, t = state.textarea;
     const modeText = pm === 'list' ? '一括送信' : pm === 'personal' ? '個別送信' : 'その他';
     const modeClass = pm === 'list' ? 'st-info' : pm === 'personal' ? 'st-ok' : 'st-warn';
+
     let rowText, rowClass;
     if (pm === 'personal') { rowText = '1 (個別送信ページ)'; rowClass = 'st-ok'; }
-    else if (pm === 'list') { rowText = r.count > 0 ? `${r.count}行` : '0行'; rowClass = r.count > 0 ? 'st-ok' : 'st-warn'; }
-    else { rowText = '-'; rowClass = 'st-info'; }
+    else if (pm === 'list') {
+      if (r.usedSelector === 'textarea-batch') {
+        rowText = r.count > 0 ? `${r.count}件 (返信欄)` : '0件';
+      } else {
+        rowText = r.count > 0 ? `${r.count}件 (fallback)` : '0件';
+      }
+      rowClass = r.count > 0 ? 'st-ok' : 'st-warn';
+    } else { rowText = '-'; rowClass = 'st-info'; }
+
     let taText, taClass;
     if (t.status === 'found') { taText = `${t.selector} (${t.where})`; taClass = 'st-ok'; } else { taText = '未検出'; taClass = 'st-warn'; }
+
     const sheetMap = { idle: { t: '未設定', c: 'st-warn' }, loading: { t: '読込中...', c: 'st-info' }, success: { t: `${state.messages.length}件`, c: 'st-ok' }, error: { t: 'エラー', c: 'st-err' } };
     const sh = sheetMap[state.sheetStatus] || sheetMap.idle;
 
     let detail = `<div><span class="label">最終検出:</span> ${formatTime(state.lastDetectTime)}</div>`;
     detail += `<div><span class="label">トリガ:</span> ${state.lastTrigger || '-'}</div>`;
-    detail += `<div><span class="label">scope:</span> ${escapeHtml(r.scopeHint || '-')}</div>`;
+    detail += `<div><span class="label">rows.where:</span> ${r.where || '-'}${r.iframeSrc ? ' (' + escapeHtml(r.iframeSrc.substring(0, 25)) + ')' : ''}</div>`;
+    detail += `<div><span class="label">scopeHint:</span> ${escapeHtml(r.scopeHint || '-')}</div>`;
+    detail += `<div><span class="label">usedSelector:</span> ${escapeHtml(r.usedSelector || '-')}</div>`;
+    detail += `<div><span class="label">batchTextareas:</span> ${r.batchTextareasCount}</div>`;
     if (r.tableScore !== null) detail += `<div><span class="label">tableScore:</span> ${r.tableScore}</div>`;
     detail += `<div><span class="label">displayCount:</span> ${r.displayCountNum !== null ? r.displayCountNum : '-'}</div>`;
-    detail += `<div><span class="label">行セレクタ:</span> ${escapeHtml(r.usedSelector || '-')}</div>`;
-    if (t.iframeSrc) detail += `<div><span class="label">iframe:</span> ${escapeHtml(t.iframeSrc)}</div>`;
-    if (state.observeTargetHint) detail += `<div><span class="label">監視:</span> ${escapeHtml(state.observeTargetHint)}</div>`;
+    detail += `<div><span class="label">docsSearched:</span> ${r.docsSearched}</div>`;
+    if (t.iframeSrc) detail += `<div><span class="label">ta.iframe:</span> ${escapeHtml(t.iframeSrc.substring(0, 30))}</div>`;
+    if (state.observeTargetHints.length > 0) detail += `<div><span class="label">監視:</span> ${escapeHtml(state.observeTargetHints.join(' | '))}</div>`;
 
     let warn = '';
     if (r.mismatchWarning) warn = `<div class="warn-box">⚠️ ${escapeHtml(r.mismatchWarning)}</div>`;
@@ -471,6 +876,8 @@
     const msgHtml = state.messages.length > 0
       ? state.messages.map((m, i) => `<div class="msg-item" data-idx="${i}" title="${escapeHtml(m)}">${escapeHtml(m.length > 40 ? m.substring(0, 40) + '...' : m)}</div>`).join('')
       : '<div class="msg-item" style="color:#6c7086;">メッセージなし</div>';
+
+    const batchBtnHtml = pm === 'list' ? `<button class="btn btn-grn" id="dp-batch-apply">表示分に一括挿入</button>` : '';
 
     return `
       <div class="header"><span class="header-title">${escapeHtml(CONFIG.ui.title)}</span><button class="header-close" id="dp-close">✕</button></div>
@@ -480,7 +887,7 @@
           <div class="section-title">ステータス</div>
           <div class="status-box">
             <div class="status-row"><span class="status-label">モード:</span><span class="status-val ${modeClass}">${modeText}</span></div>
-            <div class="status-row"><span class="status-label">行数:</span><span class="status-val ${rowClass}">${rowText}</span></div>
+            <div class="status-row"><span class="status-label">対象:</span><span class="status-val ${rowClass}">${rowText}</span></div>
             <div class="status-row"><span class="status-label">返信欄:</span><span class="status-val ${taClass}">${taText}</span></div>
             <div class="status-row"><span class="status-label">Sheet:</span><span class="status-val ${sh.c}">${sh.t}</span></div>
           </div>
@@ -501,6 +908,7 @@
         <div class="section">
           <div class="section-title">メッセージ (${state.messages.length}件)</div>
           <div class="msg-list" id="dp-msg-list">${msgHtml}</div>
+          <div class="btn-row">${batchBtnHtml}</div>
         </div>
         <div class="btn-row"><button class="btn btn-red" id="dp-stop">${state.stopped ? '停止中' : '停止'}</button><button class="btn btn-sec" id="dp-diag">診断</button></div>
       </div>
@@ -523,8 +931,9 @@
     p.querySelector('#dp-load-sheet')?.addEventListener('click', () => { const url = p.querySelector('#dp-sheet-url')?.value?.trim(); url ? fetchSheet(url) : showNotify('URLを入力', 'warn'); });
     p.querySelector('#dp-rescan')?.addEventListener('click', () => { showNotify('再検出', 'info'); runDetection('manual'); });
     p.querySelector('#dp-apply-direct')?.addEventListener('click', () => { const txt = p.querySelector('#dp-direct')?.value?.trim(); if (!txt) { showNotify('テキストを入力', 'warn'); return; } const msgs = txt.split('\n').map(l => l.trim()).filter(Boolean); if (msgs.length === 0) { showNotify('有効なメッセージなし', 'warn'); return; } state.messages = msgs; storageSet('messages', msgs); state.sheetStatus = 'success'; showNotify(`${msgs.length}件適用`, 'success'); updateUI(); });
-    p.querySelector('#dp-stop')?.addEventListener('click', () => { state.stopped = true; state.observer?.disconnect(); clearInterval(state.healthTimer); clearInterval(state.urlPollTimer); clearTimeout(state.stagedDetectTimer); showNotify('停止しました', 'warn'); updateUI(); });
+    p.querySelector('#dp-stop')?.addEventListener('click', () => { state.stopped = true; stopObservers(); clearInterval(state.healthTimer); clearInterval(state.urlPollTimer); clearTimeout(state.stagedDetectTimer); showNotify('停止しました', 'warn'); updateUI(); });
     p.querySelector('#dp-diag')?.addEventListener('click', runDiagnostic);
+    p.querySelector('#dp-batch-apply')?.addEventListener('click', batchInsertVisible);
     p.querySelector('#dp-msg-list')?.addEventListener('click', e => { const item = e.target.closest('.msg-item'); if (item) { const i = parseInt(item.dataset.idx, 10); if (!isNaN(i) && state.messages[i]) insertText(state.messages[i]); } });
     document.addEventListener('mousemove', onDragMove);
     document.addEventListener('mouseup', onDragEnd);
@@ -536,7 +945,20 @@
   function updateUI() { if (state.panel) { state.panel.innerHTML = buildPanelHtml(); bindPanelEvents(); } }
 
   function runDiagnostic() {
-    const d = { siteType: SITE_TYPE, version: '2.3.1', pageMode: state.pageMode, textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where }, rows: state.rows, lastDetectTime: state.lastDetectTime, lastTrigger: state.lastTrigger, observeTargetHint: state.observeTargetHint, messagesCount: state.messages.length, sheetStatus: state.sheetStatus, sheetError: state.sheetError, url: location.href };
+    const d = {
+      siteType: SITE_TYPE,
+      version: '2.4.0',
+      pageMode: state.pageMode,
+      textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where, iframeSrc: state.textarea.iframeSrc },
+      rows: state.rows,
+      lastDetectTime: state.lastDetectTime,
+      lastTrigger: state.lastTrigger,
+      observeTargetHints: state.observeTargetHints,
+      messagesCount: state.messages.length,
+      sheetStatus: state.sheetStatus,
+      sheetError: state.sheetError,
+      url: location.href,
+    };
     console.group('%c[DatingOps] 診断', 'color:#48bb78;font-weight:bold'); console.log(d); console.groupEnd();
     navigator.clipboard?.writeText(JSON.stringify(d, null, 2)).then(() => showNotify('診断情報コピー', 'info')).catch(() => {});
     return d;
@@ -552,26 +974,37 @@
   }
 
   // ============================================================
-  // MutationObserver - 改良版
+  // MutationObserver
   // ============================================================
-  function findObserveTarget() {
-    const best = findBestListTable();
-    if (best) return { target: best.tbody, hint: `bestTable(score=${best.score})` };
-    const cv = $('td.chatview'); if (cv) { const t = cv.closest('table'); if (t) return { target: $('tbody', t) || t, hint: 'td.chatview → table' }; }
-    const ri = $('tr.rowitem'); if (ri) { const t = ri.closest('table'); if (t) return { target: $('tbody', t) || t, hint: 'tr.rowitem → table' }; }
-    logger.warn('一覧テーブル特定できず、bodyを監視');
-    return { target: document.body, hint: 'body (fallback)' };
+  function findObserveTargetInDoc(doc) {
+    const best = findBestListTableInDoc(doc);
+    if (best) return { target: best.tbody, hint: `bestTable(${best.score})` };
+    const cv = $('td.chatview', doc); if (cv) { const t = cv.closest('table'); if (t) return { target: $('tbody', t) || t, hint: 'chatview' }; }
+    const ri = $('tr.rowitem', doc); if (ri) { const t = ri.closest('table'); if (t) return { target: $('tbody', t) || t, hint: 'rowitem' }; }
+    return { target: doc.body || doc, hint: 'body' };
   }
 
-  function startObserver() {
-    state.observer?.disconnect();
-    const info = findObserveTarget();
-    state.observeTargetHint = info.hint;
-    if (info.target === document.body) logger.warn('一覧領域特定できず、bodyを監視');
-    else logger.info(`監視対象: ${info.hint}`);
+  function stopObservers() {
+    for (const obs of state.observers) { try { obs.disconnect(); } catch {} }
+    state.observers = []; state.observeTargetHints = [];
+  }
+
+  function startObservers() {
+    stopObservers();
+    const docs = getAccessibleDocs();
     const handler = debounce(() => { if (!state.stopped) runDetection('mutation'); }, OBSERVER_DEBOUNCE_MS);
-    state.observer = new MutationObserver(muts => { if (muts.some(m => m.target.id === PANEL_ID || m.target.closest?.(`#${PANEL_ID}`))) return; handler(); });
-    state.observer.observe(info.target, { childList: true, subtree: true });
+    for (const { doc, where } of docs) {
+      try {
+        const info = findObserveTargetInDoc(doc);
+        const label = where === 'main' ? `main:${info.hint}` : `iframe:${info.hint}`;
+        state.observeTargetHints.push(label);
+        const obs = new MutationObserver(muts => { if (where === 'main' && muts.some(m => m.target.id === PANEL_ID || m.target.closest?.(`#${PANEL_ID}`))) return; handler(); });
+        obs.observe(info.target, { childList: true, subtree: true });
+        state.observers.push(obs);
+        logger.info(`Observer開始: ${label}`);
+      } catch (e) { logger.warn(`Observer失敗: ${where}`, e); }
+    }
+    if (state.observers.length === 0) logger.warn('Observerが1つもアタッチできず');
   }
 
   // ============================================================
@@ -586,7 +1019,13 @@
     state.urlPollTimer = setInterval(() => { if (location.href !== state.lastUrl) onUrlChange('poll'); }, URL_POLL_MS);
   }
 
-  function onUrlChange(src) { if (state.stopped) return; state.lastUrl = location.href; logger.info(`URL変化検知 (${src})`); startObserver(); runStagedDetection(); }
+  function onUrlChange(src) {
+    if (state.stopped) return;
+    state.lastUrl = location.href;
+    logger.info(`URL変化検知 (${src})`);
+    startObservers();
+    runStagedDetection();
+  }
 
   // ============================================================
   // ヘルスチェック
@@ -595,8 +1034,14 @@
     state.healthTimer = setInterval(() => {
       if (state.stopped) { clearInterval(state.healthTimer); return; }
       if (!$(`#${PANEL_ID}`)) createPanel();
-      const pm = state.pageMode, taOk = state.textarea.status === 'found', rowsOk = pm === 'personal' || state.rows.count > 0;
-      if (!taOk || (pm === 'list' && !rowsOk)) { logger.info('ヘルスチェック: 再検出'); runDetection('health'); }
+      const pm = state.pageMode;
+      const taOk = state.textarea.status === 'found';
+      const rowsOk = pm === 'personal' || state.rows.count > 0;
+      const dispNum = state.rows.displayCountNum;
+      if (!taOk || (pm === 'list' && !rowsOk) || (pm === 'list' && dispNum > 0 && state.rows.count === 0)) {
+        logger.info('ヘルスチェック: 再検出');
+        runDetection('health');
+      }
     }, HEALTH_CHECK_MS);
   }
 
@@ -605,19 +1050,19 @@
   // ============================================================
   function init() {
     if (state.initialized || !location.pathname.includes('/staff/')) return;
-    logger.info('初期化開始 v2.3.1');
+    logger.info('初期化開始 v2.4.0');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';
     state.pageMode = detectPageMode();
     createPanel();
     bindTriggerEvents();
-    startObserver();
+    startObservers();
     setupUrlChangeDetection();
     startHealthCheck();
     runStagedDetection();
     state.initialized = true;
-    window.__datingOps = { state, diag: runDiagnostic, rescan: () => runDetection('manual'), insert: insertText, fetchSheet, findBestListTable, scoreListTable };
+    window.__datingOps = { state, diag: runDiagnostic, rescan: () => runDetection('manual'), insert: insertText, batchInsert: batchInsertVisible, fetchSheet, getAccessibleDocs, findBatchReplyTextareas };
     logger.info('初期化完了');
   }
 
