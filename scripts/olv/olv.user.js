@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dating Ops - OLV
 // @namespace    dating-ops-tm
-// @version      2.4.4
+// @version      2.4.5
 // @description  OLV (olv29.com) 返信アシスト - 返信欄ベース行検出 + 一括挿入機能
 // @author       Dating Ops Team
 // @match        https://olv29.com/staff/*
@@ -271,39 +271,12 @@
   }
 
   // ============================================================
-  // 一括返信欄検出 (v2.4.0 新規)
+  // 一括返信欄検出 (v2.4.5 大幅改修)
   // ============================================================
-
-  // listモードの「行内返信欄」候補（nameがmessage1固定とは限らないため幅広く拾う）
-  const MESSAGE1_TEXTAREA_SELECTOR = 'textarea[name="message1"], textarea[name^="message1"], textarea[name*="message1"], textarea[id^="message1"], textarea[id*="message1"]';
-
-  function findMessage1TextareaInRow(tr) {
-    if (!tr) return null;
-    // まずは一番それっぽいものを優先
-    const ta = tr.querySelector(MESSAGE1_TEXTAREA_SELECTOR);
-    if (!ta) return null;
-    if (ta.tagName !== 'TEXTAREA') return null;
-    return ta;
-  }
-
-  function looksLikeRowReplyTextarea(ta) {
-    if (!ta) return false;
-    const tr = ta.closest('tr');
-    const table = ta.closest('table');
-    if (!tr || !table) return false;
-    // 行にチェックボックス/チャット表示っぽい要素があるなら「一覧行」の可能性が高い
-    if (tr.querySelector('input[type="checkbox"]')) return true;
-    if (tr.querySelector('td.chatview')) return true;
-    if ((tr.className || '').toLowerCase().includes('row')) return true;
-    // 最低限、tableに複数行があること
-    const tbody = table.querySelector('tbody') || table;
-    const rows = tbody.querySelectorAll('tr');
-    return rows && rows.length >= 3;
-  }
 
   /**
    * 単体送信フォーム内のtextareaかどうか判定
-   * （mailbox等の送信フォーム内textareaを doc全体スキャンで拾わないためのフィルタ）
+   * （mailbox等の送信フォーム内textareaを除外するためのフィルタ）
    */
   function isInsideSingleSendForm(ta) {
     if (!ta) return false;
@@ -316,10 +289,85 @@
   }
 
   /**
-   * 指定doc内のスコープから返信欄を収集
-   * v2.4.4: looksLikeRowReplyTextarea を緩和し検出漏れを防ぐ
+   * textarea の「返信欄らしさ」をスコアリング
+   * スコアが高いほど返信欄として採用されやすい
    */
-  function findBatchReplyTextareasInDoc(doc, win) {
+  function scoreReplyTextareaCandidate(ta) {
+    if (!ta) return -100;
+    let s = 0;
+    const name = (ta.name || '').toLowerCase();
+    const id = (ta.id || '').toLowerCase();
+    const cls = (typeof ta.className === 'string' ? ta.className : '').toLowerCase();
+    const ph = (ta.placeholder || '').toLowerCase();
+
+    // 返信欄っぽいワードを加点
+    if (name.includes('message') || name.includes('msg') || name.includes('body') || name.includes('content')) s += 5;
+    if (id.includes('message') || id.includes('msg') || id.includes('body')) s += 3;
+    if (cls.includes('msg') || cls.includes('message') || cls.includes('reply') || cls.includes('content')) s += 3;
+    if (ph.includes('メッセージ') || ph.includes('送信') || ph.includes('返信') || ph.includes('入力')) s += 2;
+
+    // message1 は特に優先
+    if (name.includes('message1') || id.includes('message1')) s += 10;
+
+    // memo/admin/note 系は大減点（保険）
+    if (name.includes('memo') || name.includes('note') || name.includes('admin') || name.includes('staff')) s -= 15;
+    if (id.includes('memo') || id.includes('note') || id.includes('admin')) s -= 15;
+    if (cls.includes('memo') || cls.includes('note') || cls.includes('admin')) s -= 10;
+
+    // サイズが大きいほど加点（返信欄は大きい想定）
+    try {
+      const cols = ta.cols || 0;
+      const rows = ta.rows || 0;
+      s += Math.min(3, Math.floor(cols / 20));
+      s += Math.min(2, Math.floor(rows / 3));
+    } catch {}
+
+    return s;
+  }
+
+  /**
+   * 行(tr)から最も返信欄らしい textarea を1つ選ぶ
+   */
+  function findReplyTextareaInRow(tr, win) {
+    if (!tr) return null;
+    const textareas = tr.querySelectorAll('textarea');
+    if (textareas.length === 0) return null;
+
+    let bestTa = null;
+    let bestScore = -Infinity;
+
+    for (const ta of textareas) {
+      if (ta.tagName !== 'TEXTAREA') continue;
+      if (isExcludedTextarea(ta)) continue;
+      if (!isElementVisible(ta, win)) continue;
+      if (isInsideSingleSendForm(ta)) continue;
+
+      const score = scoreReplyTextareaCandidate(ta);
+      if (score > bestScore) {
+        bestScore = score;
+        bestTa = ta;
+      }
+    }
+
+    return bestTa;
+  }
+
+  /**
+   * textarea のサンプル情報を取得（診断用）
+   */
+  function getTextareaSample(ta) {
+    if (!ta) return null;
+    const name = (ta.name || '').slice(0, 30);
+    const id = (ta.id || '').slice(0, 30);
+    const cls = (typeof ta.className === 'string' ? ta.className : '').slice(0, 50);
+    return { name, id, class: cls };
+  }
+
+  /**
+   * 指定doc内のスコープから返信欄を収集
+   * v2.4.5: message1固定ではなく全textareaをスコアリングして選ぶ
+   */
+  function findBatchReplyTextareasInDoc(doc, win, isBoxCharDoc) {
     const resultFromTable = [];
     const seen = new Set();
 
@@ -327,57 +375,66 @@
     const scopeTbody = best ? (best.tbody || $('tbody', best.table) || best.table) : null;
     const tableScore = best ? best.score : null;
 
-    // (1) bestTableベース: looksLikeRowReplyTextarea は参考程度（必須ではない）
+    // (1) bestTableベース: 各行から最も返信欄らしい textarea を1つ拾う
     if (scopeTbody) {
       const rows = $$('tr', scopeTbody).filter(tr => !$('th', tr));
       let rowIndex = 0;
       for (const tr of rows) {
-        const ta = findMessage1TextareaInRow(tr);
+        const ta = findReplyTextareaInRow(tr, win);
         if (!ta) { rowIndex++; continue; }
-        // looksLikeRowReplyTextarea は削除（緩和）
-        if (ta.tagName !== 'TEXTAREA') { rowIndex++; continue; }
-        if (isExcludedTextarea(ta)) { rowIndex++; continue; }
-        if (!isElementVisible(ta, win)) { rowIndex++; continue; }
         if (seen.has(ta)) { rowIndex++; continue; }
         seen.add(ta);
-        resultFromTable.push({ el: ta, selector: MESSAGE1_TEXTAREA_SELECTOR, rowIndex, scopeHint: best ? best.hint : 'bestTable' });
+        resultFromTable.push({
+          el: ta,
+          selector: 'scored-textarea',
+          rowIndex,
+          scopeHint: best ? best.hint : 'bestTable',
+          score: scoreReplyTextareaCandidate(ta),
+        });
         rowIndex++;
       }
     }
 
-    // (2) doc全体ベース: looksLikeRowReplyTextarea 撤廃、代わりに単体送信フォーム除外
+    // (2) doc全体スキャン（bestTableで0件かつ isBoxCharDoc のときのみ）
     const resultFromDoc = [];
-    const seen2 = new Set();
-    const all = $$(MESSAGE1_TEXTAREA_SELECTOR, doc.body || doc);
-    let idx = 0;
-    for (const ta of all) {
-      if (ta.tagName !== 'TEXTAREA') continue;
-      if (isExcludedTextarea(ta)) continue;
-      if (!isElementVisible(ta, win)) continue;
-      // 単体送信フォーム内のtextareaは doc全体スキャンでは除外（mailbox混入防止）
-      if (isInsideSingleSendForm(ta)) continue;
-      if (seen2.has(ta)) continue;
-      seen2.add(ta);
-      resultFromDoc.push({ el: ta, selector: MESSAGE1_TEXTAREA_SELECTOR, rowIndex: idx++, scopeHint: 'doc:message1' });
+    if (resultFromTable.length === 0 && isBoxCharDoc) {
+      const seen2 = new Set();
+      const allTas = $$('textarea', doc.body || doc);
+      let idx = 0;
+      for (const ta of allTas) {
+        if (ta.tagName !== 'TEXTAREA') continue;
+        if (isExcludedTextarea(ta)) continue;
+        if (!isElementVisible(ta, win)) continue;
+        if (isInsideSingleSendForm(ta)) continue;
+        if (seen2.has(ta)) continue;
+        seen2.add(ta);
+        resultFromDoc.push({
+          el: ta,
+          selector: 'doc-wide-scored',
+          rowIndex: idx++,
+          scopeHint: 'doc:scored',
+          score: scoreReplyTextareaCandidate(ta),
+        });
+      }
     }
 
-    // (3) 採用ルール:
-    // - table由来が 0〜2件しか無いのに、doc全体が >=3件あるなら doc全体を採用
-    // - それ以外は table由来を優先（0件ならdoc全体）
-    let chosen = resultFromTable;
-    let scopeHint = best ? best.hint : 'doc.body';
-    if (resultFromTable.length === 0) {
-      chosen = resultFromDoc;
-      scopeHint = 'doc:message1';
-    } else if (resultFromTable.length <= 2 && resultFromDoc.length >= 3) {
-      chosen = resultFromDoc;
-      scopeHint = 'doc:message1(fallback)';
-    }
+    // 採用ルール: table由来を優先、0件ならdoc全体
+    let chosen = resultFromTable.length > 0 ? resultFromTable : resultFromDoc;
+    let scopeHint = resultFromTable.length > 0 ? (best ? best.hint : 'bestTable') : 'doc:scored';
 
-    // totalCandidates: MESSAGE1セレクタで拾えた総数（デバッグ用）
-    const totalCandidates = $$(MESSAGE1_TEXTAREA_SELECTOR, doc.body || doc).length;
+    // 診断用: 全textarea数とサンプル
+    const allTextareas = $$('textarea', doc.body || doc);
+    const allTextareasCount = allTextareas.length;
+    const sampleTextareas = allTextareas.slice(0, 5).map(getTextareaSample);
 
-    return { textareas: chosen, scopeHint, tableScore, totalCandidates };
+    return {
+      textareas: chosen,
+      scopeHint,
+      tableScore,
+      totalCandidates: chosen.length,
+      allTextareasCount,
+      sampleTextareas,
+    };
   }
 
   /**
@@ -483,15 +540,18 @@
     // 各docのスコアと返信欄情報を収集
     const docResults = [];
     for (const { doc, win, where, iframeSrc, href } of docs) {
-      const res = findBatchReplyTextareasInDoc(doc, win);
-      const displayCountLocal = extractDisplayCountFromDoc(doc);
       const isMailbox = isMailboxDoc({ iframeSrc, href });
       const isBoxChar = isBoxCharDoc({ iframeSrc, href });
+      // isBoxCharDoc を渡して doc全体スキャンの許可判定に使う
+      const res = findBatchReplyTextareasInDoc(doc, win, isBoxChar);
+      const displayCountLocal = extractDisplayCountFromDoc(doc);
       docResults.push({
         doc, win, where, iframeSrc, href,
         textareas: res.textareas,
         chosenCount: res.textareas.length,
         totalCandidates: res.totalCandidates,
+        allTextareasCount: res.allTextareasCount,
+        sampleTextareas: res.sampleTextareas,
         scopeHint: res.scopeHint,
         tableScore: res.tableScore,
         displayCountLocal,
@@ -500,23 +560,33 @@
       });
     }
 
-    // ソート
+    /**
+     * ソート優先順位 (v2.4.5):
+     * (1) isBoxChar && chosenCount > 0 を最優先（box_char が1件でもあれば mailbox より先）
+     * (2) chosenCount > 0 を優先
+     * (3) mailbox は最下位（box_char が取れていれば絶対に採用しない）
+     * (4) chosenCount が大きい方を優先
+     * (5) globalDisplayCount との差が小さい方を優先
+     * (6) tableScore が高い方
+     */
     docResults.sort((a, b) => {
       const aCount = a.chosenCount;
       const bCount = b.chosenCount;
 
-      // (1) chosenCount > 0 を優先
+      // (1) isBoxChar && chosenCount > 0 を最優先
+      const aBoxCharWithCount = a.isBoxChar && aCount > 0;
+      const bBoxCharWithCount = b.isBoxChar && bCount > 0;
+      if (aBoxCharWithCount && !bBoxCharWithCount) return -1;
+      if (!aBoxCharWithCount && bBoxCharWithCount) return 1;
+
+      // (2) chosenCount > 0 を優先
       if (aCount > 0 && bCount === 0) return -1;
       if (aCount === 0 && bCount > 0) return 1;
       if (aCount === 0 && bCount === 0) return 0;
 
-      // (2) mailbox は最下位（chosenCount>=2 の非mailboxがあれば後ろ）
-      if (!a.isMailbox && b.isMailbox && aCount >= 2) return -1;
-      if (a.isMailbox && !b.isMailbox && bCount >= 2) return 1;
-
-      // (3) isBoxChar を優先
-      if (a.isBoxChar && !b.isBoxChar) return -1;
-      if (!a.isBoxChar && b.isBoxChar) return 1;
+      // (3) mailbox は最下位（box_char以外でも非mailboxを優先）
+      if (!a.isMailbox && b.isMailbox) return -1;
+      if (a.isMailbox && !b.isMailbox) return 1;
 
       // (4) chosenCount が大きい方を優先
       if (aCount !== bCount) return bCount - aCount;
@@ -532,7 +602,8 @@
       return bScore - aScore;
     });
 
-    // 最初に chosenCount > 0 の doc を採用
+    // box_char で chosenCount > 0 があれば無条件でそれを採用
+    // なければ最初に chosenCount > 0 の doc を採用
     for (const dr of docResults) {
       if (dr.chosenCount > 0) {
         // scopeHint にどのdocを選んだか情報を追加
@@ -547,11 +618,12 @@
           tableScore: dr.tableScore,
           docsSearched: docs.length,
           totalCandidates: dr.totalCandidates,
+          allTextareasCount: dr.allTextareasCount,
         };
       }
     }
 
-    return { textareas: [], count: 0, where: null, iframeSrc: null, href: null, scopeHint: 'none', tableScore: null, docsSearched: docs.length, totalCandidates: 0 };
+    return { textareas: [], count: 0, where: null, iframeSrc: null, href: null, scopeHint: 'none', tableScore: null, docsSearched: docs.length, totalCandidates: 0, allTextareasCount: 0 };
   }
 
   // ============================================================
@@ -1112,18 +1184,22 @@
     const docCandidates = [];
     for (const { doc, win, where, iframeSrc, href } of docs) {
       try {
-        const res = findBatchReplyTextareasInDoc(doc, win);
+        const isMailbox = isMailboxDoc({ iframeSrc, href });
+        const isBoxChar = isBoxCharDoc({ iframeSrc, href });
+        const res = findBatchReplyTextareasInDoc(doc, win, isBoxChar);
         const best = findBestListTableInDoc(doc);
         docCandidates.push({
           where,
           iframeSrc: iframeSrc || null,
           href: href || null,
-          isMailbox: isMailboxDoc({ iframeSrc, href }),
-          isBoxChar: isBoxCharDoc({ iframeSrc, href }),
+          isMailbox,
+          isBoxChar,
           displayCountExtracted: extractDisplayCountFromDoc(doc),
           tableScore: best ? best.score : null,
           chosenCount: res.textareas.length,
           totalCandidates: res.totalCandidates,
+          allTextareasCount: res.allTextareasCount,
+          sampleTextareas: res.sampleTextareas,
           scopeHint: res.scopeHint,
         });
       } catch (e) {
@@ -1133,7 +1209,7 @@
 
     const d = {
       siteType: SITE_TYPE,
-      version: '2.4.4',
+      version: '2.4.5',
       pageMode: state.pageMode,
       textarea: { status: state.textarea.status, selector: state.textarea.selector, where: state.textarea.where, iframeSrc: state.textarea.iframeSrc },
       rows: state.rows,
@@ -1238,7 +1314,7 @@
   // ============================================================
   function init() {
     if (state.initialized || !location.pathname.includes('/staff/')) return;
-    logger.info('初期化開始 v2.4.4');
+    logger.info('初期化開始 v2.4.5');
     state.messages = storageGet('messages', []);
     state.sheetUrl = storageGet('sheetUrl', '');
     if (state.messages.length > 0) state.sheetStatus = 'success';
